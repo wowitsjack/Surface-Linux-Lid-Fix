@@ -4,6 +4,7 @@
 # (For Surface laptops, and potentially other devices)
 #
 # Fixes the "lid won't suspend after first resume" bug
+# and provides tools to monitor lid state and reload GNOME session.
 #
 # Usage: ./surface_lidfix.sh
 #
@@ -21,7 +22,7 @@ NC='\033[0m' # No Color
 
 # Script info
 SCRIPT_TITLE="Surface Lid Fix"
-VERSION="1.0"
+VERSION="1.1" # Incremented version for inlined scripts
 INSTALL_DIR="/opt/surface-lidfix"
 SERVICE_NAME="surface-lidfix"
 CURRENT_DIR="$(pwd)"
@@ -79,17 +80,17 @@ setup_sudo() {
         error_msg "Sudo privileges not granted. Exiting."
         exit 1
     fi
-    
+
     # Keep sudo alive in background
     while true; do sudo -n true; sleep 60; kill -0 "$$" || exit; done 2>/dev/null &
-    
+
     success_msg "Sudo privileges acquired and will be kept alive."
 }
 
 # Check if this is a Surface device
 check_surface() {
     info_msg "Detecting device type..."
-    
+
     local is_surface=false
     local product_info="Unknown"
 
@@ -101,21 +102,21 @@ check_surface() {
             success_msg "Detected Surface device: $product_info"
         fi
     fi
-    
+
     if ! $is_surface; then
         if sudo dmesg 2>/dev/null | grep -qi surface; then
             is_surface=true
             success_msg "Surface device detected in kernel messages."
         fi
     fi
-    
+
     if ! $is_surface; then
         if lsmod | grep -qi surface; then
             is_surface=true
             success_msg "Surface kernel modules detected."
         fi
     fi
-    
+
     if ! $is_surface; then
         warning_msg "This does not appear to be a Surface device."
         info_msg "Detected system: $product_info"
@@ -132,26 +133,498 @@ check_surface() {
 # Install the service files
 install_service() {
     step_msg "Installing ${SCRIPT_TITLE} service..."
-    
-    local required_files=("lid_suspend_monitor.py" "post_resume_lid_fix.py" "reload_gnome_session.py")
-    for file in "${required_files[@]}"; do
-        if [[ ! -f "$CURRENT_DIR/$file" ]]; then
-            error_msg "Required file not found: $file"
-            error_msg "Ensure all Python scripts are in the current directory: $CURRENT_DIR"
-            return 1
-        fi
-    done
-    
+
     step_msg "Creating installation directory: $INSTALL_DIR"
     sudo mkdir -p "$INSTALL_DIR"
+
+    step_msg "Creating Python scripts in $INSTALL_DIR..."
+
+    # Create lid_suspend_monitor.py
+    sudo tee "$INSTALL_DIR/lid_suspend_monitor.py" > /dev/null << 'EOF_LID_MONITOR'
+#!/usr/bin/env python3
+"""
+Lid Suspend Monitor - A script to force suspend when lid is closed
+"""
+
+import time
+import subprocess
+import sys
+import os
+
+def get_lid_state():
+    """Check if the lid is open or closed"""
+    try:
+        with open('/proc/acpi/button/lid/LID0/state', 'r') as f:
+            state = f.read().strip()
+            return 'closed' in state.lower()
+    except FileNotFoundError:
+        try:
+            with open('/proc/acpi/button/lid/LID/state', 'r') as f:
+                state = f.read().strip()
+                return 'closed' in state.lower()
+        except FileNotFoundError:
+            print("LID_MONITOR: Error - Could not find lid state file!", flush=True)
+            return None # Indicate error
+
+def force_suspend():
+    """Force the system to suspend"""
+    try:
+        print("LID_MONITOR: Forcing system suspend...", flush=True)
+        # Use -i flag to ignore inhibitors that might be blocking suspend
+        # This command requires root privileges or specific sudo configuration.
+        # If run as a user service without sudo, this will likely fail.
+        subprocess.run(['systemctl', 'suspend', '-i'], check=True)
+        return True
+    except subprocess.CalledProcessError as e:
+        print(f"LID_MONITOR: Error - Failed to suspend: {e}", flush=True)
+        return False
+    except FileNotFoundError:
+        print("LID_MONITOR: Error - systemctl command not found.", flush=True)
+        return False
+
+
+def main():
+    print("LID_MONITOR: Lid Suspend Monitor Started.", flush=True)
+    print("LID_MONITOR: Monitoring lid state. Close lid to test suspend action.", flush=True)
+
+    lid_was_open = True
+    consecutive_closed_checks = 0
+    required_closed_checks = 2 # Require 2 consecutive checks (1 second total)
+
+    while True:
+        try:
+            lid_is_closed = get_lid_state()
+
+            if lid_is_closed is None: # Error reading lid state
+                time.sleep(5) # Wait longer before retrying if file not found
+                continue
+
+            if lid_is_closed:
+                if lid_was_open:
+                    print("LID_MONITOR: Lid closed detected. Starting check countdown...", flush=True)
+                    consecutive_closed_checks = 1
+                    lid_was_open = False
+                else: # Lid was already considered closed
+                    consecutive_closed_checks += 1
+                    print(f"LID_MONITOR: Lid remains closed. Check {consecutive_closed_checks}/{required_closed_checks}.", flush=True)
+
+                if consecutive_closed_checks >= required_closed_checks:
+                    print("LID_MONITOR: Lid confirmed closed. Attempting suspend...", flush=True)
+                    if force_suspend():
+                        print("LID_MONITOR: Suspend command issued. Monitor will pause until resume.", flush=True)
+                        # After suspend, the script might be restarted by systemd, or continue.
+                        # Assume systemd restarts it on resume if it's a service.
+                        # For now, just reset state for next cycle.
+                        time.sleep(10) # Give system time to actually suspend
+                        lid_was_open = True # Assume lid will be open on resume
+                        consecutive_closed_checks = 0
+                    else:
+                        print("LID_MONITOR: Suspend attempt failed. Will retry on next lid close cycle.", flush=True)
+                        # Reset to re-detect lid close event properly
+                        lid_was_open = True
+                        consecutive_closed_checks = 0
+                        time.sleep(5) # Wait before retrying
+            else: # Lid is open
+                if not lid_was_open:
+                    print("LID_MONITOR: Lid opened.", flush=True)
+                lid_was_open = True
+                consecutive_closed_checks = 0
+
+            time.sleep(0.5) # Polling interval
+
+        except KeyboardInterrupt:
+            print("\nLID_MONITOR: Monitor stopped by user.", flush=True)
+            break
+        except Exception as e:
+            print(f"LID_MONITOR: Error in main loop: {e}", flush=True)
+            # traceback.print_exc() # For more detailed debugging
+            time.sleep(5) # Wait before continuing after an unexpected error
+
+if __name__ == "__main__":
+    # The service file should handle running as the correct user.
+    # If sudo is needed for 'systemctl suspend -i' and run as user,
+    # it must be configured in sudoers.
+    # if os.geteuid() != 0:
+    #     print("LID_MONITOR: Warning - This script may need root privileges to force suspend.", flush=True)
+    main()
+EOF_LID_MONITOR
+
+    # Create post_resume_lid_fix.py
+    sudo tee "$INSTALL_DIR/post_resume_lid_fix.py" > /dev/null << 'EOF_POST_RESUME_FIX'
+#!/usr/bin/env python3
+"""
+Post-Resume Lid Fix Script
+This script attempts to fix lid detection after resume from suspend.
+"""
+
+import subprocess
+import time
+import sys
+import os
+
+def log_msg(message):
+    print(f"POST_RESUME_FIX: {message}", flush=True)
+
+def run_cmd(command_list, check=False, capture=True, as_root=True):
+    cmd_to_run = command_list
+    if as_root and os.geteuid() != 0:
+        cmd_to_run = ['sudo'] + command_list
     
-    step_msg "Copying Python scripts..."
-    sudo cp "$CURRENT_DIR/lid_suspend_monitor.py" "$INSTALL_DIR/"
-    sudo cp "$CURRENT_DIR/post_resume_lid_fix.py" "$INSTALL_DIR/"
-    sudo cp "$CURRENT_DIR/reload_gnome_session.py" "$INSTALL_DIR/"
+    log_msg(f"Executing: {' '.join(cmd_to_run)}")
+    try:
+        result = subprocess.run(cmd_to_run, capture_output=capture, text=True, check=check, timeout=15)
+        if capture:
+            if result.stdout:
+                log_msg(f"Stdout: {result.stdout.strip()}")
+            if result.stderr:
+                log_msg(f"Stderr: {result.stderr.strip()}")
+        return result
+    except subprocess.CalledProcessError as e:
+        log_msg(f"Error executing command: {e}")
+        if capture:
+            log_msg(f"Stdout: {e.stdout.strip() if e.stdout else 'N/A'}")
+            log_msg(f"Stderr: {e.stderr.strip() if e.stderr else 'N/A'}")
+    except subprocess.TimeoutExpired:
+        log_msg(f"Timeout executing: {' '.join(command_list)}")
+    except FileNotFoundError:
+        log_msg(f"Command not found: {command_list[0]}")
+    except Exception as e_gen:
+        log_msg(f"Unexpected error running command {' '.join(command_list)}: {e_gen}")
+    return None
+
+
+def check_for_blocking_inhibitors():
+    log_msg("Checking for systemd inhibitors...")
+    result = run_cmd(['systemd-inhibit', '--list', '--no-pager'], as_root=False) # systemd-inhibit list doesn't need root
+    if result and result.returncode == 0:
+        lines = result.stdout.strip().split('\n')
+        blocking_inhibitors = []
+        for line in lines[1:]:  # Skip header
+            # Looking for 'gsd-media-keys' and 'gsd-power' specifically related to 'sleep' and 'block'
+            if ('gsd-media-keys' in line or 'gsd-power' in line) and 'sleep' in line and 'block' in line:
+                blocking_inhibitors.append(line.strip())
+        
+        if blocking_inhibitors:
+            log_msg(f"Found {len(blocking_inhibitors)} potentially problematic blocking inhibitors:")
+            for inhibitor in blocking_inhibitors:
+                log_msg(f"  - {inhibitor}")
+        return blocking_inhibitors
+    return []
+
+def kill_problematic_gsd_services():
+    """Kill problematic GNOME services that might interfere."""
+    # Note: systemd should restart these if they are session services.
+    # Running this script as root means `killall` will target root's processes if any,
+    # or all users' processes. This might be too broad.
+    # It's often better for the user's session monitor to handle user processes.
+    # However, since this script is run as root by the service, we'll proceed cautiously.
+    services_to_kill = ['gsd-media-keys', 'gsd-power']
+    killed_any = False
+    for service in services_to_kill:
+        log_msg(f"Attempting to terminate process: {service}")
+        # Use pkill to target processes by name, regardless of user, if run as root.
+        # Sending SIGTERM first.
+        result = run_cmd(['pkill', '-TERM', service], check=False, capture=False)
+        if result and result.returncode == 0:
+            log_msg(f"{service} processes sent SIGTERM.")
+            killed_any = True
+        else:
+            # Check if it was not running
+            check_running = run_cmd(['pgrep', service], capture=True, as_root=False)
+            if not (check_running and check_running.stdout.strip()):
+                 log_msg(f"{service} was not running or no processes found.")
+            else:
+                log_msg(f"Could not terminate {service} with SIGTERM or it was not found.")
+    if killed_any:
+        log_msg("Waiting briefly for services to terminate...")
+        time.sleep(2)
+
+
+def reload_acpi_modules():
+    """Reload ACPI modules to fix hardware detection."""
+    # This script runs as root, so sudo in run_cmd is redundant but harmless.
+    modules = ['button'] # 'video' is too risky. 'processor' or 'ac' might be candidates if 'button' isn't enough.
+    log_msg("Reloading ACPI kernel modules...")
+    for module in modules:
+        full_module_name = f'acpi_{module}' # Many ACPI related modules are prefixed
+        log_msg(f"Attempting to reload module: {full_module_name}")
+        run_cmd(['modprobe', '-r', full_module_name], check=False) # Allow failure if not loaded
+        time.sleep(0.5)
+        run_cmd(['modprobe', full_module_name], check=True) # Expect success on loading
+
+def check_lid_state():
+    """Check current ACPI lid state."""
+    log_msg("Checking current ACPI lid state...")
+    path1 = '/proc/acpi/button/lid/LID0/state'
+    path2 = '/proc/acpi/button/lid/LID/state'
+    lid_path_to_use = None
+
+    if os.path.exists(path1):
+        lid_path_to_use = path1
+    elif os.path.exists(path2):
+        lid_path_to_use = path2
+    
+    if lid_path_to_use:
+        try:
+            with open(lid_path_to_use, 'r') as f:
+                state = f.read().strip()
+                log_msg(f"Current lid state from {lid_path_to_use}: {state}")
+                return True
+        except Exception as e:
+            log_msg(f"Error reading lid state from {lid_path_to_use}: {e}")
+            return False
+    else:
+        log_msg("Error: Could not find standard ACPI lid state file.")
+        return False
+
+def trigger_acpi_device_rescan():
+    """Attempt to trigger a rescan of ACPI devices. Experimental."""
+    # This is highly system-dependent and might not exist or work.
+    # Common path for ACPI bus rescan: /sys/bus/acpi/scan
+    # Other paths for specific devices might be PNP0C0D (Lid device) or similar.
+    # Example for a generic ACPI bus scan (if supported by kernel):
+    # acpi_scan_path = '/sys/bus/acpi/scan'
+    # if os.path.exists(acpi_scan_path):
+    #     log_msg(f"Attempting to write '1' to {acpi_scan_path} to trigger ACPI bus rescan.")
+    #     try:
+    #         with open(acpi_scan_path, 'w') as f:
+    #             f.write('1\n')
+    #         log_msg("ACPI bus rescan trigger sent.")
+    #         time.sleep(1) # Give time for scan
+    #     except Exception as e:
+    #         log_msg(f"Error triggering ACPI bus rescan via {acpi_scan_path}: {e}")
+    # else:
+    #     log_msg(f"ACPI bus rescan path {acpi_scan_path} not found.")
+
+    # Attempt to re-evaluate _STA for the common lid device (PNP0C0D)
+    # This is often how the system checks device status.
+    lid_device_sta_path = "/sys/bus/acpi/devices/PNP0C0D:00/_STA" # Common path for ACPI Lid Device
+    if os.path.exists(lid_device_sta_path.rsplit('/',1)[0]): # Check if device exists
+        log_msg(f"Attempting to trigger re-evaluation of _STA for ACPI lid device.")
+        # This requires writing to a control file, typically needs echo 1 > path/_STA
+        # The path object itself might not be directly writable by Python's open().
+        # Using shell for this might be more reliable if it's a write-only trigger.
+        # However, _STA is usually read-only. This example is speculative.
+        # A more common way to re-evaluate is to unbind/bind the driver if one is associated.
+        # For PNP0C0D, it's often handled directly by the 'button' module.
+        log_msg("Note: Directly writing to _STA is usually not how re-evaluation is triggered. Relying on module reload.")
+    else:
+        log_msg(f"ACPI Lid device path {lid_device_sta_path.rsplit('/',1)[0]} not found for _STA re-evaluation.")
+
+
+def main():
+    log_msg("Post-Resume Lid Fix script started.")
+    if os.geteuid() != 0:
+        log_msg("Error: This script must be run as root.")
+        sys.exit(1)
+
+    log_msg("Initial system state check:")
+    check_lid_state()
+    time.sleep(1)
+
+    inhibitors = check_for_blocking_inhibitors()
+    if inhibitors:
+        log_msg("Attempting to resolve problematic gsd services due to inhibitors...")
+        kill_problematic_gsd_services() # This is speculative; gsd services run as user.
+                                      # Root killing them might have unintended side effects or not be effective
+                                      # if they are respawned by the user's session manager.
+        time.sleep(2) # Give time for services to react or be restarted.
+
+    log_msg("Applying hardware-level fixes...")
+
+    # Sequence of fixes:
+    # 1. Reload ACPI button module (often most effective for pure ACPI lid issues)
+    reload_acpi_modules()
+    time.sleep(1)
+
+    # 2. Trigger ACPI device rescan (experimental, may not be necessary if module reload works)
+    # trigger_acpi_device_rescan() # Commented out as it's highly experimental and may not be needed
+    # time.sleep(1)
+
+    # 3. If GSD services were an issue, killing them might have helped.
+    #    It's hard to be certain from a root script about user session services.
+    #    The `lid_suspend_monitor.py` running as user might be better placed to handle this.
+
+    log_msg("Post-resume fixes applied.")
+    log_msg("Final system state check:")
+    check_lid_state()
+
+    final_inhibitors = check_for_blocking_inhibitors()
+    if final_inhibitors:
+        log_msg(f"Warning: Still found {len(final_inhibitors)} potentially problematic inhibitors after fixes.")
+    else:
+        log_msg("No problematic gsd-media-keys/gsd-power sleep inhibitors found after fixes.")
+
+    log_msg("Post-Resume Lid Fix script finished.")
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        log_msg("\nFix script cancelled by user.")
+    except Exception as e:
+        log_msg(f"\nUnexpected error in Post-Resume Lid Fix script: {e}")
+        # import traceback
+        # traceback.print_exc() # For detailed debugging
+        sys.exit(1)
+EOF_POST_RESUME_FIX
+
+    # Create reload_gnome_session.py
+    sudo tee "$INSTALL_DIR/reload_gnome_session.py" > /dev/null << 'EOF_RELOAD_GNOME'
+#!/usr/bin/env python3
+"""
+GNOME Session Reloader
+This script restarts GNOME Shell to address potential UI issues.
+"""
+
+import subprocess
+import time
+import sys
+import os
+
+def log_msg(message):
+    print(f"RELOAD_GNOME: {message}", flush=True)
+
+def restart_gnome_shell_gdbus():
+    """Restart GNOME Shell using gdbus (preferred method)."""
+    log_msg("Attempting to restart GNOME Shell via gdbus...")
+    try:
+        # Ensure DISPLAY and XDG_RUNTIME_DIR are sensible for a user session
+        # The service file for lid_suspend_monitor.py sets these.
+        # If run directly, ensure they are set.
+        if not os.getenv('DISPLAY') or not os.getenv('XDG_RUNTIME_DIR'):
+            log_msg("Warning: DISPLAY or XDG_RUNTIME_DIR not set. gdbus call might fail.")
+            # Attempt to find XDG_RUNTIME_DIR if not set
+            if not os.getenv('XDG_RUNTIME_DIR'):
+                uid = os.geteuid()
+                runtime_dir_path = f"/run/user/{uid}"
+                if os.path.isdir(runtime_dir_path):
+                    os.environ['XDG_RUNTIME_DIR'] = runtime_dir_path
+                    log_msg(f"Set XDG_RUNTIME_DIR to {runtime_dir_path}")
+
+
+        command = [
+            'gdbus', 'call', '--session',
+            '--dest', 'org.gnome.Shell',
+            '--object-path', '/org/gnome/Shell',
+            '--method', 'org.gnome.Shell.Eval',
+            'global.reexec_self()'
+        ]
+        # This command often causes the gdbus call itself to timeout or return an error
+        # even if the shell restarts successfully, because the shell process it's talking to is replaced.
+        # We use a short timeout and primarily check if an error indicating "no reply" or similar occurs,
+        # which can be a sign of success.
+        result = subprocess.run(command, capture_output=True, text=True, timeout=5)
+
+        # Success is often indicated by specific errors like "No reply" or timeout,
+        # as the shell process terminates and restarts. A return code of 0 is less common.
+        if result.returncode == 0:
+            log_msg("GNOME Shell restart initiated (gdbus returned 0).")
+            return True
+        # Error "GDBus.Error:org.freedesktop.DBus.Error.NoReply" often means success
+        elif "NoReply" in result.stderr or "timeout" in result.stderr.lower():
+            log_msg("GNOME Shell restart likely initiated (gdbus timed out or got no reply - this is often normal).")
+            return True # Assume success
+        else:
+            log_msg(f"gdbus method failed. Return code: {result.returncode}")
+            log_msg(f"Stderr: {result.stderr.strip()}")
+            return False
+
+    except subprocess.TimeoutExpired:
+        log_msg("gdbus command timed out (this is often normal for shell restart). Assuming success.")
+        return True
+    except FileNotFoundError:
+        log_msg("Error: gdbus command not found.")
+        return False
+    except Exception as e:
+        log_msg(f"Error restarting GNOME Shell with gdbus: {e}")
+        return False
+
+def alternative_restart_killall():
+    """Alternative method using killall -HUP gnome-shell."""
+    log_msg("Attempting alternative GNOME Shell restart via killall -HUP...")
+    try:
+        # Sending HUP signal is a common way to ask daemons to reload.
+        subprocess.run(['killall', '-HUP', 'gnome-shell'], capture_output=True, check=True, text=True)
+        log_msg("Signal HUP sent to gnome-shell. It should restart if running.")
+        return True
+    except subprocess.CalledProcessError as e:
+        # CalledProcessError means killall returned non-zero.
+        # This can happen if gnome-shell wasn't running or if killall had other issues.
+        if "no process found" in e.stderr.lower():
+            log_msg("killall: gnome-shell process not found.")
+        else:
+            log_msg(f"killall method failed: {e.stderr.strip()}")
+        return False
+    except FileNotFoundError:
+        log_msg("Error: killall command not found.")
+        return False
+    except Exception as e_gen:
+        log_msg(f"Unexpected error with killall method: {e_gen}")
+        return False
+
+def check_gnome_session_vars():
+    """Check environment variables to guess if in a GNOME session."""
+    desktop = os.environ.get('XDG_CURRENT_DESKTOP', '').lower()
+    session = os.environ.get('DESKTOP_SESSION', '').lower()
+    is_gnome = 'gnome' in desktop or 'gnome' in session or 'gnome-shell' in session
+    
+    if is_gnome:
+        log_msg(f"Detected GNOME-related session (XDG_CURRENT_DESKTOP='{desktop}', DESKTOP_SESSION='{session}').")
+        return True
+    else:
+        log_msg(f"Non-GNOME or undetermined session (XDG_CURRENT_DESKTOP='{desktop}', DESKTOP_SESSION='{session}').")
+        log_msg("This script is primarily for GNOME. Proceeding with caution.")
+        return False # Or True if you want to try anyway
+
+def main():
+    log_msg("GNOME Session Reloader script started.")
+    log_msg("Attempting to refresh the GNOME Shell session.")
+
+    if not check_gnome_session_vars():
+        # Decide whether to exit or try anyway
+        # For now, let's try anyway, but with a warning.
+        log_msg("Warning: Not definitively a GNOME session. Results may vary.")
+        # sys.exit(1) # Optionally exit if not GNOME
+
+    log_msg("Checking session status...")
+    time.sleep(0.5) # Brief pause
+
+    if restart_gnome_shell_gdbus():
+        log_msg("GNOME Shell reload (via gdbus) initiated. Your desktop should refresh shortly.")
+    else:
+        log_msg("Primary gdbus method for GNOME Shell restart did not confirm success. Trying alternative (killall -HUP)...")
+        if alternative_restart_killall():
+            log_msg("Alternative GNOME Shell restart (killall -HUP) signal sent.")
+        else:
+            log_msg("Both gdbus and killall methods for GNOME Shell restart failed or could not confirm success.")
+            log_msg("No further automatic actions taken to restart GNOME Shell.")
+
+    log_msg("GNOME Session Reloader script finished.")
+    log_msg("If UI issues persist, consider logging out and back in, or restarting the display manager (e.g., sudo systemctl restart gdm).")
+
+
+if __name__ == "__main__":
+    # This script is intended to be run by the user, or a service running as the user.
+    if os.geteuid() == 0:
+        log_msg("Warning: This script is typically run as a regular user, not root, to interact with the user's GNOME session.")
+    
+    try:
+        main()
+    except KeyboardInterrupt:
+        log_msg("\nReload script cancelled by user.")
+    except Exception as e:
+        log_msg(f"\nUnexpected error in GNOME Session Reloader: {e}")
+        # import traceback
+        # traceback.print_exc() # For detailed debugging
+        sys.exit(1)
+EOF_RELOAD_GNOME
+
     sudo chmod +x "$INSTALL_DIR"/*.py
-    
-    step_msg "Creating systemd service: ${SERVICE_NAME}.service"
+    success_msg "Python scripts created in $INSTALL_DIR."
+
+    step_msg "Creating systemd service: ${SERVICE_NAME}.service (Lid Monitor)"
+    # This service runs lid_suspend_monitor.py as the current user
     sudo tee "/etc/systemd/system/${SERVICE_NAME}.service" > /dev/null << EOF
 [Unit]
 Description=${SCRIPT_TITLE} - Lid Suspend Monitor
@@ -162,16 +635,17 @@ Wants=graphical-session.target
 Type=simple
 User=$USER
 Environment=DISPLAY=:0
-Environment=XDG_RUNTIME_DIR=/run/user/$(id -u)
+Environment=XDG_RUNTIME_DIR=/run/user/$(id -u $USER)
 ExecStart=/usr/bin/python3 $INSTALL_DIR/lid_suspend_monitor.py
 Restart=always
 RestartSec=5
 
 [Install]
-WantedBy=default.target
+WantedBy=graphical-session.target
 EOF
 
-    step_msg "Creating post-resume service: ${SERVICE_NAME}-resume.service"
+    step_msg "Creating post-resume service: ${SERVICE_NAME}-resume.service (Post Resume Fix)"
+    # This service runs post_resume_lid_fix.py as root
     sudo tee "/etc/systemd/system/${SERVICE_NAME}-resume.service" > /dev/null << EOF
 [Unit]
 Description=${SCRIPT_TITLE} - Post Resume Fix
@@ -179,7 +653,7 @@ After=suspend.target sleep.target hybrid-sleep.target hibernate.target
 
 [Service]
 Type=oneshot
-ExecStart=$INSTALL_DIR/post_resume_lid_fix.py
+ExecStart=/usr/bin/python3 $INSTALL_DIR/post_resume_lid_fix.py
 User=root
 
 [Install]
@@ -191,72 +665,77 @@ EOF
 #!/bin/bash
 # Quick lid fix command
 # Part of ${SCRIPT_TITLE}
-sudo python3 $INSTALL_DIR/post_resume_lid_fix.py
+echo "Manually running Post-Resume Lid Fix script..."
+sudo /usr/bin/python3 $INSTALL_DIR/post_resume_lid_fix.py
 EOF
 
     sudo tee "/usr/local/bin/fix-session" > /dev/null << EOF
 #!/bin/bash
-# Quick session fix command  
+# Quick session fix command
 # Part of ${SCRIPT_TITLE}
-python3 $INSTALL_DIR/reload_gnome_session.py
+echo "Manually running GNOME Session Reloader script..."
+/usr/bin/python3 $INSTALL_DIR/reload_gnome_session.py
 EOF
 
     sudo chmod +x /usr/local/bin/fix-lid
     sudo chmod +x /usr/local/bin/fix-session
-    
+
     step_msg "Reloading systemd daemon..."
     sudo systemctl daemon-reload
-    
-    success_msg "Service installed successfully."
+
+    success_msg "Service installation routines complete."
     info_msg "You can now use these commands globally:"
-    echo -e "  ${GREEN}fix-lid${NC}     - Manually apply lid detection fix"
-    echo -e "  ${GREEN}fix-session${NC} - Manually fix GNOME session issues"
+    echo -e "  ${GREEN}fix-lid${NC}     - Manually apply post-resume lid fix (runs as root)"
+    echo -e "  ${GREEN}fix-session${NC} - Manually attempt to reload GNOME session (runs as user)"
     return 0
 }
 
 # Start and enable services
 enable_service() {
     step_msg "Enabling and starting ${SCRIPT_TITLE} services..."
-    
+
     sudo systemctl enable "${SERVICE_NAME}.service"
     sudo systemctl enable "${SERVICE_NAME}-resume.service"
-    sudo systemctl start "${SERVICE_NAME}.service"
-    
-    success_msg "Services enabled and started."
-    info_msg "The services will automatically start on boot and after resume."
+    # Start the monitor service. The resume service is oneshot and triggered by system events.
+    sudo systemctl restart "${SERVICE_NAME}.service" # Use restart to ensure fresh start if already running
+
+    success_msg "Services enabled and ${SERVICE_NAME}.service (Lid Monitor) started/restarted."
+    info_msg "The Lid Monitor service will attempt to run continuously."
+    info_msg "The Post Resume Fix service will run automatically after system resume."
 }
 
 # Stop and disable services
 disable_service() {
     step_msg "Stopping and disabling ${SCRIPT_TITLE} services..."
-    
+
     sudo systemctl stop "${SERVICE_NAME}.service" 2>/dev/null || true
     sudo systemctl disable "${SERVICE_NAME}.service" 2>/dev/null || true
+    # The resume service is oneshot, so stop doesn't apply; disable is sufficient.
     sudo systemctl disable "${SERVICE_NAME}-resume.service" 2>/dev/null || true
-    
-    success_msg "Services disabled."
+
+    success_msg "Services stopped and disabled."
 }
 
 # Complete uninstall
 uninstall() {
     step_msg "Uninstalling ${SCRIPT_TITLE}..."
-    
+
     disable_service # This already prints messages
-    
+
     step_msg "Removing service files..."
     sudo rm -f "/etc/systemd/system/${SERVICE_NAME}.service"
     sudo rm -f "/etc/systemd/system/${SERVICE_NAME}-resume.service"
-    
+
     step_msg "Removing installation directory: $INSTALL_DIR"
     sudo rm -rf "$INSTALL_DIR"
-    
+
     step_msg "Removing helper commands..."
     sudo rm -f /usr/local/bin/fix-lid
     sudo rm -f /usr/local/bin/fix-session
-    
+
     step_msg "Reloading systemd daemon..."
     sudo systemctl daemon-reload
-    
+
     success_msg "${SCRIPT_TITLE} has been completely uninstalled."
     info_msg "Thank you for using this tool."
 }
@@ -266,39 +745,47 @@ check_status() {
     echo ""
     step_msg "${SCRIPT_TITLE} Status:"
     echo ""
-    
-    # Main service status
+
+    # Main service status (Lid Monitor)
+    info_msg "Status for ${SERVICE_NAME}.service (Lid Monitor):"
     if systemctl is-active --quiet "${SERVICE_NAME}.service"; then
-        success_msg "Main service (${SERVICE_NAME}.service): RUNNING"
+        success_msg "  Service State: RUNNING"
     else
-        warning_msg "Main service (${SERVICE_NAME}.service): STOPPED"
+        warning_msg "  Service State: STOPPED / INACTIVE"
     fi
-    
+
     if systemctl is-enabled --quiet "${SERVICE_NAME}.service"; then
-        success_msg "Main service auto-start: ENABLED"
+        success_msg "  Auto-start on boot: ENABLED"
     else
-        warning_msg "Main service auto-start: DISABLED"
+        warning_msg "  Auto-start on boot: DISABLED"
     fi
     echo ""
 
     # Post-resume service status
+    info_msg "Status for ${SERVICE_NAME}-resume.service (Post Resume Fix):"
+    # This is a oneshot service, so is-active is usually 'inactive' unless it failed
     if systemctl is-enabled --quiet "${SERVICE_NAME}-resume.service"; then
-        success_msg "Post-resume service (${SERVICE_NAME}-resume.service): ENABLED (will run on resume)"
+        success_msg "  Auto-run on resume: ENABLED"
     else
-        warning_msg "Post-resume service (${SERVICE_NAME}-resume.service): DISABLED"
+        warning_msg "  Auto-run on resume: DISABLED"
     fi
-    
+    echo "  (This is a oneshot service, typically inactive until resume)"
     echo ""
-    info_msg "Recent logs for ${SERVICE_NAME}.service (main service):"
-    sudo journalctl -u "${SERVICE_NAME}.service" --no-pager -n 5 --output=cat 2>/dev/null || echo "No logs available or permission denied."
+
+
+    info_msg "Recent logs for ${SERVICE_NAME}.service (Lid Monitor - 5 lines):"
+    sudo journalctl -u "${SERVICE_NAME}.service" --no-pager -n 5 --output=cat 2>/dev/null || echo "  No logs available or permission denied."
+    echo ""
+    info_msg "Recent logs for ${SERVICE_NAME}-resume.service (Post Resume Fix - 5 lines, last run):"
+    sudo journalctl -u "${SERVICE_NAME}-resume.service" --no-pager -n 5 --output=cat 2>/dev/null || echo "  No logs available or permission denied."
 }
 
-# Test the lid detection
-test_lid() {
+# Test the lid detection (ACPI level)
+test_lid_acpi() {
     echo ""
-    step_msg "Testing lid detection..."
+    step_msg "Testing ACPI Lid State Detection..."
     echo ""
-    
+
     local lid_path=""
     if [ -f "/proc/acpi/button/lid/LID0/state" ]; then
         lid_path="/proc/acpi/button/lid/LID0/state"
@@ -306,40 +793,43 @@ test_lid() {
         lid_path="/proc/acpi/button/lid/LID/state"
     fi
 
-    local initial_lid_state=""
+    local initial_lid_state="unknown"
     if [ -n "$lid_path" ]; then
         initial_lid_state=$(cat "$lid_path")
-        info_msg "Initial lid state from $lid_path: $initial_lid_state"
+        info_msg "Initial ACPI lid state from $lid_path: $initial_lid_state"
     else
-        error_msg "Could not find ACPI lid state file (e.g., /proc/acpi/button/lid/LID0/state)."
-        info_msg "This test may not be conclusive for your system."
-        # Do not return 1, allow test to proceed if possible, or user can observe logs.
+        error_msg "Could not find standard ACPI lid state file (e.g., /proc/acpi/button/lid/LID0/state)."
+        info_msg "This test checks raw ACPI state. The monitor service uses similar paths."
+        return 1
     fi
-    
+
     echo ""
     info_msg "Please CLOSE and then OPEN your laptop lid now."
-    echo -n "Monitoring for lid state changes for 10 seconds... "
-    
+    echo -n "Monitoring ACPI lid state for 10 seconds... "
+
+    local state_changed=false
     for i in {10..1}; do
-        echo -ne "\rMonitoring for lid state changes for 10 seconds... $i "
+        echo -ne "\rMonitoring ACPI lid state for 10 seconds... $i "
+        local current_state=$(cat "$lid_path" 2>/dev/null || echo "$initial_lid_state")
+        if [[ "$current_state" != "$initial_lid_state" ]]; then
+            state_changed=true
+        fi
         sleep 1
     done
-    echo -e "\rMonitoring for lid state changes for 10 seconds... Done."
-    
-    if [ -n "$lid_path" ]; then
-        local new_lid_state=$(cat "$lid_path")
-        info_msg "New lid state from $lid_path: $new_lid_state"
-        if [[ "$new_lid_state" != "$initial_lid_state" ]]; then
-            success_msg "Lid state changed. ACPI level detection appears to be working."
-        else
-            warning_msg "Lid state did not change from '$initial_lid_state'. Ensure you operated the lid."
-        fi
+    echo -e "\rMonitoring ACPI lid state for 10 seconds... Done."
+
+    local final_lid_state=$(cat "$lid_path" 2>/dev/null || echo "$initial_lid_state")
+    info_msg "Final ACPI lid state from $lid_path: $final_lid_state"
+
+    if $state_changed || [[ "$final_lid_state" != "$initial_lid_state" ]]; then
+        success_msg "ACPI lid state changed during the test. Raw detection appears functional."
     else
-        info_msg "Could not read ACPI lid state. Check service logs for detection activity."
+        warning_msg "ACPI lid state did not change from '$initial_lid_state'."
+        warning_msg "Ensure you operated the lid. If so, there might be an issue with ACPI reporting."
     fi
-    
-    info_msg "Test complete. If the services are running, they should react to lid events."
-    info_msg "You can also check with: journalctl -f -u ${SERVICE_NAME}.service"
+
+    info_msg "Test complete. The Lid Monitor service polls this state."
+    info_msg "You can also check monitor logs: journalctl -f -u ${SERVICE_NAME}.service"
 }
 
 # Main menu
@@ -349,13 +839,13 @@ show_menu() {
     echo -e "${WHITE}                        Main Menu                          ${NC}"
     echo -e "${WHITE}═══════════════════════════════════════════════════════════${NC}"
     echo ""
-    echo -e "  ${GREEN}1)${NC} Install ${SCRIPT_TITLE}"
+    echo -e "  ${GREEN}1)${NC} Install/Reinstall ${SCRIPT_TITLE}"
     echo -e "  ${GREEN}2)${NC} Start/Enable Services"
     echo -e "  ${GREEN}3)${NC} Stop/Disable Services"
-    echo -e "  ${GREEN}4)${NC} Check Service Status"
-    echo -e "  ${GREEN}5)${NC} Test Lid Detection"
-    echo -e "  ${GREEN}6)${NC} Run Manual Lid Fix (fix-lid)"
-    echo -e "  ${GREEN}7)${NC} Run Manual Session Fix (fix-session)"
+    echo -e "  ${GREEN}4)${NC} Check Service Status & Logs"
+    echo -e "  ${GREEN}5)${NC} Test ACPI Lid Detection"
+    echo -e "  ${GREEN}6)${NC} Run Manual Lid Fix (via fix-lid)"
+    echo -e "  ${GREEN}7)${NC} Run Manual Session Reload (via fix-session)"
     echo -e "  ${RED}8)${NC} Uninstall ${SCRIPT_TITLE}"
     echo -e "  ${RED}9)${NC} Exit"
     echo ""
@@ -363,48 +853,24 @@ show_menu() {
     echo ""
 }
 
-# Manual fixes
-manual_lid_fix() {
+# Manual fixes callers
+manual_lid_fix_caller() {
     echo ""
-    step_msg "Attempting manual lid fix..."
-    echo ""
-    
+    step_msg "Attempting manual lid fix execution..."
     if [ -x "/usr/local/bin/fix-lid" ]; then
-        sudo /usr/local/bin/fix-lid
-        success_msg "Manual lid fix command executed."
-    elif [ -f "$INSTALL_DIR/post_resume_lid_fix.py" ]; then
-        info_msg "Helper command /usr/local/bin/fix-lid not found. Running script directly from $INSTALL_DIR."
-        sudo python3 "$INSTALL_DIR/post_resume_lid_fix.py"
-        success_msg "Manual lid fix script executed."
-    elif [ -f "$CURRENT_DIR/post_resume_lid_fix.py" ]; then
-        info_msg "${SCRIPT_TITLE} not installed. Attempting to run script from current directory: $CURRENT_DIR."
-        sudo python3 "$CURRENT_DIR/post_resume_lid_fix.py"
-        success_msg "Manual lid fix script (local) executed."
+        /usr/local/bin/fix-lid
     else
-        error_msg "Lid fix script (post_resume_lid_fix.py) not found."
-        error_msg "Please install ${SCRIPT_TITLE} first, or ensure the script is in the current directory."
+        error_msg "Command /usr/local/bin/fix-lid not found. Is ${SCRIPT_TITLE} installed?"
     fi
 }
 
-manual_gnome_session_fix() {
+manual_gnome_session_fix_caller() {
     echo ""
-    step_msg "Attempting manual GNOME session fix..."
-    echo ""
-    
+    step_msg "Attempting manual GNOME session reload execution..."
     if [ -x "/usr/local/bin/fix-session" ]; then
         /usr/local/bin/fix-session
-        success_msg "Manual session fix command executed."
-    elif [ -f "$INSTALL_DIR/reload_gnome_session.py" ]; then
-        info_msg "Helper command /usr/local/bin/fix-session not found. Running script directly from $INSTALL_DIR."
-        python3 "$INSTALL_DIR/reload_gnome_session.py"
-        success_msg "Manual session fix script executed."
-    elif [ -f "$CURRENT_DIR/reload_gnome_session.py" ]; then
-        info_msg "${SCRIPT_TITLE} not installed. Attempting to run script from current directory: $CURRENT_DIR."
-        python3 "$CURRENT_DIR/reload_gnome_session.py"
-        success_msg "Manual session fix script (local) executed."
     else
-        error_msg "Session fix script (reload_gnome_session.py) not found."
-        error_msg "Please install ${SCRIPT_TITLE} first, or ensure the script is in the current directory."
+        error_msg "Command /usr/local/bin/fix-session not found. Is ${SCRIPT_TITLE} installed?"
     fi
 }
 
@@ -412,33 +878,31 @@ manual_gnome_session_fix() {
 main() {
     clear
     show_banner
-    
+
     check_root
-    setup_sudo 
+    setup_sudo
     check_surface
-    
+
     echo ""
     step_msg "Welcome to ${SCRIPT_TITLE}!"
-    info_msg "This tool helps resolve lid suspend issues, primarily on Surface Linux devices."
+    info_msg "This tool helps resolve lid suspend issues and manage related services."
     echo ""
-    warning_msg "For installation, ensure the following Python scripts are in the current directory ($CURRENT_DIR):"
-    echo "   • lid_suspend_monitor.py"
-    echo "   • post_resume_lid_fix.py" 
-    echo "   • reload_gnome_session.py"
-    echo ""
-    
+    # Removed warning about needing Python scripts as they are now inlined.
+
     while true; do
         show_menu
         read -p "Choose an option (1-9): " choice
-        
+
         case $choice in
             1)
                 echo ""
                 if install_service; then
                     echo ""
-                    read -p "Installation successful. Enable and start services now? (Y/n): " enable_choice
+                    read -p "Installation routines complete. Enable and start services now? (Y/n): " enable_choice
                     if [[ ! "$enable_choice" =~ ^[Nn]$ ]]; then
                         enable_service
+                    else
+                        info_msg "Services not started. You can start them via option 2."
                     fi
                 else
                     error_msg "Installation failed. Please check messages above."
@@ -454,13 +918,13 @@ main() {
                 check_status
                 ;;
             5)
-                test_lid
+                test_lid_acpi
                 ;;
             6)
-                manual_lid_fix
+                manual_lid_fix_caller
                 ;;
             7)
-                manual_gnome_session_fix
+                manual_gnome_session_fix_caller
                 ;;
             8)
                 echo ""
@@ -477,6 +941,13 @@ main() {
             9)
                 echo ""
                 info_msg "Exiting ${SCRIPT_TITLE}."
+                # Kill the sudo keep-alive background process
+                # This is a bit aggressive; might be better to let it time out.
+                # For now, find and kill it.
+                SUDO_KEEPALIVE_PID=$(pgrep -f "sudo -n true.*sleep 60")
+                if [ -n "$SUDO_KEEPALIVE_PID" ]; then
+                    sudo kill "$SUDO_KEEPALIVE_PID" 2>/dev/null
+                fi
                 echo ""
                 exit 0
                 ;;
@@ -484,7 +955,7 @@ main() {
                 error_msg "Invalid option: '$choice'. Please choose a number from 1 to 9."
                 ;;
         esac
-        
+
         echo ""
         read -p "Press Enter to return to the menu..."
         clear
