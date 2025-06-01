@@ -1,3 +1,7 @@
+Fixes Surface series laptops failing to enter sleep mode/suspend when the lid is closed.
+
+To resume, open lid and tap power button, or press any keyboard key (model depending).
+
 
 *   **1) Install Surface Lid Fix:** Installs the services and helper scripts.
 *   **2) Start/Enable Services:** Enables the services to start on boot and starts them immediately.
