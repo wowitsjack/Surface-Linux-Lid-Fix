@@ -1,6 +1,8 @@
-Fixes Surface series laptops failing to enter sleep mode/suspend when the lid is closed.
+==========Fixes Surface series laptops failing to enter sleep mode/suspend when the lid is closed.
 
-To resume, open lid and tap power button, or press any keyboard key (model depending).
+To resume, open lid and tap power button, or press any keyboard key (model depending).==========
+
+Tested on Pop!_OS 22.04 w/Surface Linux kernel.
 
 
 *   **1) Install Surface Lid Fix:** Installs the services and helper scripts.
