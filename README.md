@@ -32,6 +32,8 @@ This will stop and disable the services, remove the systemd service files, delet
 
 ## Troubleshooting
 
+IF YOU EXPERIENCE SCALING RESETS ON POP!_OS, DISABLE HiDPI AGENT IN DIPLSAY SETTINGS
+
 *   **Python Scripts Not Found:** Ensure `lid_suspend_monitor.py`, `post_resume_lid_fix.py`, and `reload_gnome_session.py` are in the same directory as `surface_lidfix.sh` *before running the installation option*.
 *   **Permissions:** The script requires `sudo` for installation and some operations. It will prompt when needed. Do not run the main script itself with `sudo`.
 *   **Service Status:** If you suspect issues, use option `4) Check Service Status` from the menu. You can also check logs directly:
