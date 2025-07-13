@@ -7,7 +7,7 @@
 # and provides tools to monitor lid state and reload GNOME session.
 #
 # Usage: ./surface_lidfix.sh
-#
+# 
 
 set -e
 
