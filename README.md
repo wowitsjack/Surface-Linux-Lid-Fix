@@ -1,54 +1,132 @@
-==========Fixes Surface series laptops failing to enter sleep mode/suspend when the lid is closed.
+# Surface Laptop 5 s2idle Fix
 
-To resume, open lid and tap power button, or press any keyboard key (model depending).==========
+A kernel module that fixes the "death sleep" bug on the Microsoft Surface Laptop 5, where the laptop enters s2idle suspend and never wakes up again, requiring a hard reset.
 
-Tested on Pop!_OS 22.04 w/Surface Linux kernel.
+Also includes a bonus script to fix audio crackling common on Intel Alder Lake devices running Linux.
 
+## Symptoms
 
-*   **1) Install Surface Lid Fix:** Installs the services and helper scripts.
-*   **2) Start/Enable Services:** Enables the services to start on boot and starts them immediately.
-*   **3) Stop/Disable Services:** Stops the services and disables them from starting on boot.
-*   **4) Check Service Status:** Shows the current status (running, enabled) of the services and recent log entries.
-*   **5) Test Lid Detection:** Guides you through a manual lid open/close test and reports ACPI state.
-*   **6) Run Manual Lid Fix (`fix-lid`):** Manually executes the `post_resume_lid_fix.py` script. This is also available globally as `sudo fix-lid` after installation.
-*   **7) Run Manual Session Fix (`fix-session`):** Manually executes `reload_gnome_session.py`. This is also available globally as `fix-session` after installation.
-*   **8) Uninstall Surface Lid Fix:** Removes all installed files, services, and helper commands.
-*   **9) Exit:** Exits the script.
+- Closing the lid suspends the laptop, but it **never wakes up**
+- Power button, keyboard, trackpad do nothing
+- Only a hard reset (hold power 10+ seconds) recovers the machine
+- `dmesg` may show `GPE 0x52` spam or `pm_system_cancel_wakeup` after resume
+- Happens specifically with s2idle (`cat /sys/power/mem_sleep` shows `[s2idle]`)
 
-### Global Helper Commands
+## Quick Install
 
-After installation, two helper commands are available system-wide:
+```bash
+git clone https://github.com/wowitsjack/Surface-Linux-Lid-Fix.git
+cd Surface-Linux-Lid-Fix
+sudo ./install.sh
+```
 
-*   `sudo fix-lid`: Manually triggers the lid fix mechanism (runs `post_resume_lid_fix.py`).
-*   `fix-session`: Manually reloads the GNOME session (runs `reload_gnome_session.py`).
+That's it. The module builds against your running kernel, installs itself, and persists across reboots.
 
-## Uninstallation
+## What It Does
 
-1.  Run `./surface_lidfix.sh`.
-2.  Choose option `8) Uninstall Surface Lid Fix`.
-3.  Confirm the uninstallation.
+Intel's INTC1055 GPIO pinctrl power-gates during s2idle, which corrupts the PADCFG0 register for pin 213 (the lid sensor). The RXINV bit flips, causing a phantom edge that fires a spurious SCI on GPE 0x52. The ACPI handler calls `pm_system_cancel_wakeup()`, which permanently poisons the wakeup framework. The system never wakes.
 
-This will stop and disable the services, remove the systemd service files, delete the installation directory (`/opt/surface-lidfix`), and remove the global helper commands.
+This module:
 
-## Troubleshooting
+- **Saves and restores PADCFG0/PADCFG1** at every suspend stage to fix the corruption before anything sees it
+- **Masks GPE 0x52** during suspend, only unmasking it inside the s2idle loop for genuine lid-open detection
+- **Registers a wakeup handler** that runs before `acpi_ec_dispatch_gpe()` to fix corruption and clear GPE status before it can promote a spurious full resume
+- **LPS0 check callback** polls RXSTATE for genuine lid-open events, only calling `pm_system_wakeup()` when the lid is actually open
+- **Post-resume failsafe** detects spurious wakes (lid still closed, no power button) and re-suspends automatically, with exponential backoff to prevent rapid sleep-wake storms
+- **SW_LID input device** emits lid open/close events so your desktop environment handles suspend policy natively (the module does NOT force suspend on lid close)
 
-IF YOU EXPERIENCE SCALING RESETS ON POP!_OS, DISABLE HiDPI AGENT IN DISPLAY SETTINGS
+## Uninstall
 
-*   **Python Scripts Not Found:** Ensure `lid_suspend_monitor.py`, `post_resume_lid_fix.py`, and `reload_gnome_session.py` are in the same directory as `surface_lidfix.sh` *before running the installation option*.
-*   **Permissions:** The script requires `sudo` for installation and some operations. It will prompt when needed. Do not run the main script itself with `sudo`.
-*   **Service Status:** If you suspect issues, use option `4) Check Service Status` from the menu. You can also check logs directly:
-    ```bash
-    systemctl status surface-lidfix.service
-    systemctl status surface-lidfix-resume.service
-    journalctl -u surface-lidfix.service -f
-    journalctl -u surface-lidfix-resume.service
-    ```
-*   **"Device not detected as Surface":** The script tries to detect if it's running on a Surface device. If not, it will warn you but allow you to proceed. The fix might still work on other laptops with similar ACPI/lid issues.
+```bash
+sudo ./uninstall.sh
+```
 
-## Contributing
+## Bonus: Fix Audio Crackling
 
-Contributions, bug reports, and feature requests are welcome! Please feel free to open an issue or submit a pull request on the [GitHub repository](https://github.com/wowitsjack/Surface-Linux-Lid-Fix/).
+Intel Alder Lake laptops (including Surface Laptop 5) often have audio crackling/popping under Linux, caused by aggressive HDA codec power management, zero PipeWire buffer headroom, and deep C-states (C8/C10) missing audio IRQ deadlines.
+
+```bash
+./utils/fix-audio-crackling.sh
+```
+
+This script:
+1. Disables HDA codec power save (`power_save=0`, `power_save_controller=N`)
+2. Adds PipeWire ALSA headroom (1024 samples via WirePlumber rule)
+3. Disables C8 and C10 deep sleep states (keeps C1E and C6 for battery life)
+4. Restarts PipeWire
+
+All changes are persistent across reboots.
+
+## Manual Installation
+
+If you prefer to do everything by hand:
+
+```bash
+# 1. Install kernel headers
+sudo apt install linux-headers-$(uname -r)
+
+# 2. Build the module
+make
+
+# 3. Copy to updates directory
+sudo cp surface_s2idle_fix.ko /lib/modules/$(uname -r)/updates/
+sudo depmod -a
+
+# 4. Load it
+sudo modprobe surface_s2idle_fix
+
+# 5. Make it load on boot
+echo "surface_s2idle_fix" | sudo tee /etc/modules-load.d/surface-s2idle-fix.conf
+
+# 6. Verify
+dmesg | grep surface_s2idle_fix
+```
+
+## Manual Audio Fix
+
+```bash
+# HDA power save off
+echo 0 | sudo tee /sys/module/snd_hda_intel/parameters/power_save
+echo N | sudo tee /sys/module/snd_hda_intel/parameters/power_save_controller
+echo "options snd_hda_intel power_save=0 power_save_controller=N" | sudo tee /etc/modprobe.d/audio-no-powersave.conf
+
+# PipeWire headroom
+mkdir -p ~/.config/wireplumber/wireplumber.conf.d
+cat > ~/.config/wireplumber/wireplumber.conf.d/51-alsa-headroom.conf << 'EOF'
+monitor.alsa.rules = [
+  {
+    matches = [
+      { node.name = "~alsa_output.*" }
+    ]
+    actions = {
+      update-props = {
+        api.alsa.headroom = 1024
+      }
+    }
+  }
+]
+EOF
+
+# Disable deep C-states (C8 = state3, C10 = state4)
+for cpu in /sys/devices/system/cpu/cpu*/cpuidle/state3/disable; do echo 1 | sudo tee $cpu > /dev/null; done
+for cpu in /sys/devices/system/cpu/cpu*/cpuidle/state4/disable; do echo 1 | sudo tee $cpu > /dev/null; done
+
+# Restart PipeWire
+systemctl --user restart pipewire pipewire-pulse wireplumber
+```
+
+## Tested On
+
+- Microsoft Surface Laptop 5 (Intel i7-1265U / i5-1245U)
+- Kernel 6.18.x (linux-surface)
+- Ubuntu 25.10, Ubuntu 24.04
+- GNOME, KDE Plasma
+
+## Related
+
+- [linux-surface PR #2011](https://github.com/linux-surface/linux-surface/pull/2011) - upstream patch submission
+- [linux-surface](https://github.com/linux-surface/linux-surface) - Linux on Surface devices
 
 ## License
 
-This project is licensed under the MIT License.
+GPL-2.0 - see [LICENSE](LICENSE)
