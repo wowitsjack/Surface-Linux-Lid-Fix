@@ -1,6 +1,6 @@
 # Surface Series s2idle Fix
 
-A kernel module that fixes the "death sleep" bug on the Microsoft Surfac series, where the laptop enters s2idle suspend and never wakes up again, requiring a hard reset.
+A kernel module that fixes the "death sleep" bug on the Microsoft Surface series, where the laptop enters s2idle suspend and never wakes up again, requiring a hard reset.
 
 Also includes a bonus script to fix audio crackling common on Intel Alder Lake devices running Linux.
 
