@@ -1,4 +1,4 @@
-# Surface Laptop 5 s2idle Fix
+# Surface Series s2idle Fix
 
 A kernel module that fixes the "death sleep" bug on the Microsoft Surface Laptop 5, where the laptop enters s2idle suspend and never wakes up again, requiring a hard reset.
 
