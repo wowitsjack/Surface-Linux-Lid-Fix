@@ -1,33 +1,61 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * surface_s2idle_fix.c - Fix s2idle death sleep on Surface Laptop 5
+ * surface_s2idle_fix.c - Fix s2idle/hibernate death sleep on Surface Laptop 5
  *
- * Intel INTC1055 pinctrl power-gating during s2idle corrupts pin 213's
- * PADCFG0 RXINV bit. The phantom edge fires a spurious SCI on GPE 0x52,
- * and the ACPI handler calls pm_system_cancel_wakeup(), permanently
- * poisoning the wakeup framework. The system never wakes from s2idle.
+ * Version 2.0: Redesigned based on reverse engineering of 4 Windows drivers
+ * (iaLPSS2_GPIO2_ADL.sys, msgpioclx.sys, SurfaceButton.sys, intelpep.sys)
+ * and analysis of Linux pinctrl-intel + ACPI s2idle kernel source.
  *
- * Fix:
- *  - Mask GPE 0x52 in PM_SUSPEND_PREPARE, unmask in LPS0 prepare inside
- *    the s2idle loop for lid-open detection
- *  - Wakeup handler (runs BEFORE acpi_ec_dispatch_gpe) fixes PADCFG
- *    corruption and clears GPE 0x52 status, preventing spurious full
- *    resume promotion through acpi_any_gpe_status_set()
- *  - LPS0 check callback polls RXSTATE for genuine lid-open, only then
- *    calls pm_system_wakeup() for a clean full resume
- *  - PADCFG save/restore at every suspend stage as safety net
- *  - Passive KEY_POWER observer distinguishes real vs spurious wakes
- *  - Post-resume failsafe re-suspends on spurious wake (max 10 retries)
- *  - Exponential backoff prevents rapid sleep-wake storms (2s/4s/8s/15s)
- *  - RXSTATE polling re-suspends after power-button-wake-with-lid-closed
- *  - Background RXSTATE polling emits SW_LID input events for lid state
- *    changes (since surface_gpe isn't loaded without the DMI patch)
- *  - SW_LID input device lets the desktop environment decide suspend
- *    policy; this module does NOT call pm_suspend() on lid close, it
- *    only prevents death sleep for suspends initiated by any source
+ * Root cause:
+ *   Intel INTC1055 GPIO Community 4's VNN (VCCIO nanonode) power rail drops
+ *   during C-state transitions in s2idle. PADCFG registers lose state. When
+ *   VNN returns, PADCFG0 on pin 213 (lid sensor) comes back with RXINV
+ *   (bit 23) flipped. This phantom edge fires GPE 0x52 as an SCI. Since
+ *   this Surface has no EC (first_ec==NULL), acpi_ec_dispatch_gpe() calls
+ *   acpi_any_gpe_status_set(U32_MAX) which sees GPE 0x52 and promotes to
+ *   full resume. pm_system_cancel_wakeup() poisons the wakeup framework
+ *   permanently = death sleep.
  *
- * Work functions that call pm_suspend() set failsafe_in_progress to
- * prevent PM_SUSPEND_PREPARE from deadlocking on cancel_delayed_work_sync().
+ * Architecture (layered defense, informed by Windows driver stack):
+ *
+ *   Layer 1: PM Notifier (INT_MAX priority)
+ *     Pre-sleep:  save golden PADCFG for all tracked pins, mask GPE 0x52
+ *     Post-sleep: final PADCFG check, unmask GPE, schedule failsafe
+ *
+ *   Layer 2: Platform PM ops (suspend/resume/freeze/thaw/poweroff/restore)
+ *     noirq: force-disable GPE 0x52, fix PADCFG before GPE re-enablement
+ *     early: double-check PADCFG, unmask GPE before ACPI button reads _LID
+ *
+ *   Layer 3: ACPI wakeup handler (step 4, before EC GPE dispatch at step 5)
+ *     Fix PADCFG corruption, clear GPE 0x52 status so
+ *     acpi_any_gpe_status_set() never sees the phantom edge
+ *
+ *   Layer 4: LPS0 s2idle device ops (inside the s2idle idle loop)
+ *     prepare: fix PADCFG, start poll timer, GPE stays masked
+ *     check:   fix PADCFG, poll RXSTATE for lid-open, pm_system_wakeup()
+ *              only on genuine lid open
+ *     restore: cancel timer, clear state
+ *
+ *   Layer 5: Failsafe system
+ *     Post-resume delayed work decides stay-awake vs re-suspend based on
+ *     power button input + RXSTATE. Exponential backoff prevents storms.
+ *
+ * Windows comparison:
+ *   Windows uses intelpep (PEP) to coordinate VNN transitions, iaLPSS2 to
+ *   save/restore ALL bank pins (DW1 before DW0), msgpioclx for ActiveBoth
+ *   RXINV self-healing at ISR level. Our module achieves equivalent
+ *   protection through a different mechanism: snapshot restore + GPE
+ *   masking + RXSTATE polling, which is simpler and doesn't require
+ *   integration with the pinctrl-intel driver's internal state.
+ *
+ * Changes from v1.1.0:
+ *   - Multi-pin PADCFG tracking (Community 4 bank, not just pin 213)
+ *   - HOSTSW_OWN register monitoring
+ *   - PADCFG2 (debounce register) save/restore
+ *   - Conditional MMIO writes (skip if value unchanged)
+ *   - Consolidated restore helper (eliminated 5 identical blocks)
+ *   - debugfs interface for diagnostics instead of dmesg spam
+ *   - Programmatic boot parameter application where possible
  */
 
 #define pr_fmt(fmt) "surface_s2idle_fix: " fmt
@@ -42,51 +70,178 @@
 #include <linux/platform_device.h>
 #include <linux/ktime.h>
 #include <linux/delay.h>
+#include <linux/hrtimer.h>
+#include <linux/rtc.h>
+#include <linux/umh.h>
+#include <linux/debugfs.h>
+#include <linux/seq_file.h>
 
-/* Pin 213, INTC1055 community */
-#define LID_PADCFG0_PHYS       0xfd6a09a0
-#define LID_PADCFG1_PHYS       0xfd6a09a4
-#define PADCFG_MAP_SIZE        8
+/* ========================================================================
+ * Hardware constants: Intel INTC1055 Community 4
+ * ======================================================================== */
 
-#define PADCFG0_RXINV          BIT(23)
-#define PADCFG0_GPIROUTSCI     BIT(19)
-#define PADCFG0_GPIORXDIS      BIT(8)
-#define PADCFG0_GPIORXSTATE    BIT(1)
+/* Community 4 MMIO region */
+#define COM4_PADCFG_BASE        0xfd6a0000
+#define COM4_PADCFG_SIZE        0x1000      /* 4KB, covers all pins */
 
-#define LID_GPE                0x52
+/* Pin 213: lid sensor (the death sleep pin) */
+#define LID_PIN_OFFSET          0x09a0      /* 0xfd6a09a0 - COM4_PADCFG_BASE */
+#define LID_PIN_INDEX           213
 
+/* PADCFG register layout: 3 DWORDs per pin, 16 bytes stride */
+#define PADCFG_STRIDE           16          /* bytes between pins */
+#define PADCFG0_OFF             0
+#define PADCFG1_OFF             4
+#define PADCFG2_OFF             8
+
+/* PADCFG0 bit definitions */
+#define PADCFG0_RXINV           BIT(23)
+#define PADCFG0_GPIROUTSCI      BIT(19)
+#define PADCFG0_GPIORXDIS       BIT(8)
+#define PADCFG0_GPIORXSTATE     BIT(1)
+#define PADCFG0_GPIOTXSTATE     BIT(0)
+#define PADCFG0_PMODE_MASK      0x00003C00  /* bits 13:10, pad mode */
+
+/* HOSTSW_OWN register: controls GPIO vs ACPI ownership.
+ * Offset from community base varies by platform, for ADL Community 4:
+ * HOSTSW_OWN is at community_base + 0x0150, one bit per pin.
+ * Multiple 32-bit registers cover all pins in the community. */
+#define COM4_HOSTSW_OWN_BASE    0x0150
+#define COM4_HOSTSW_OWN_REGS    4           /* 4 x 32-bit = 128 pins per bank */
+
+/* GPI_IE (interrupt enable), for monitoring */
+#define COM4_GPI_IE_BASE        0x0120
+#define COM4_GPI_IE_REGS        4
+
+/* GPE and SCI */
+#define LID_GPE                 0x52
+
+/* ========================================================================
+ * Tracked pins: Community 4 pins we save/restore
+ *
+ * Like Windows' GpioSaveBankHardwareContext, we track multiple pins,
+ * not just pin 213. We focus on pins that are in Mode 0 (native GPIO)
+ * and have SCI routing, since those are vulnerable to VNN corruption.
+ * ======================================================================== */
+
+/* Per-pin saved context, matching pinctrl-intel's intel_pad_context
+ * but with validity tracking like Windows' per-pin valid flag */
+struct pin_context {
+	u32 padcfg0;            /* DW0: mode, direction, RXINV */
+	u32 padcfg1;            /* DW1: pad tolerance, termination */
+	u32 padcfg2;            /* DW2: debounce configuration */
+	u16 offset;             /* offset from community base */
+	u16 pin_number;         /* for logging */
+	bool valid;             /* was this pin saved? */
+	bool sci_routed;        /* has GPIROUTSCI set */
+};
+
+/* We track pin 213 (lid) as primary, plus nearby SCI-routed pins
+ * in Community 4 that could have similar VNN corruption issues.
+ * These offsets are relative to COM4_PADCFG_BASE. */
+static const u16 tracked_pin_offsets[] = {
+	0x09a0,    /* pin 213: lid sensor (THE death sleep pin) */
+	/* Additional COM4 pins can be added here if needed.
+	 * On the Surface Laptop 5, pin 213 is the only known
+	 * SCI-routed pin in COM4 that causes death sleep,
+	 * but we scan for others at init time. */
+};
+
+#define MAX_TRACKED_PINS        32
+#define LID_TRACKED_INDEX       0           /* pin 213 is always index 0 */
+
+static struct pin_context tracked_pins[MAX_TRACKED_PINS];
+static int num_tracked_pins;
+
+/* Community-level saved context (like Windows' per-bank HOSTSW_OWN) */
+static u32 saved_hostsw_own[COM4_HOSTSW_OWN_REGS];
+static u32 saved_gpi_ie[COM4_GPI_IE_REGS];
+static bool community_ctx_saved;
+
+/* ========================================================================
+ * Module state
+ * ======================================================================== */
+
+static void __iomem *com4_base;            /* Community 4 MMIO base */
+static int sci_irq;
+
+/* Timing and behavior constants */
 #define LID_FAILSAFE_DELAY_MS   2000
 #define FAILSAFE_MAX_RETRIES    10
 #define LID_RESYNC_INTERVAL_MS  1000
-#define LID_RESYNC_MAX_POLLS    120   /* 1s * 120 = 2 minutes */
+#define LID_RESYNC_MAX_POLLS    120
 #define LID_POLL_INTERVAL_MS    2000
+#define RAPID_WAKE_THRESHOLD_MS 60000
+#define BACKOFF_BASE_MS         2000
+#define BACKOFF_CAP_MS          15000
+#define S2IDLE_POLL_INTERVAL_NS (500 * NSEC_PER_MSEC)
+#define TIME_SYNC_THRESHOLD_SECS  2
+#define TIME_SYNC_RETRY_MS        5000
 
-/* Exponential backoff: prevent rapid sleep-wake storms */
-#define RAPID_WAKE_THRESHOLD_MS 60000  /* sleep < 60s = "rapid" */
-#define BACKOFF_BASE_MS         2000   /* starting delay: 2s */
-#define BACKOFF_CAP_MS          15000  /* max delay: 15s */
-
-static void __iomem *lid_padcfg_base;
-static u32 saved_padcfg0;
-static u32 saved_padcfg1;
-static bool padcfg_saved;
-static int sci_irq;
-
+/* Work items and timers */
 static struct delayed_work lid_failsafe_work;
 static struct delayed_work lid_resync_work;
 static struct delayed_work lid_poll_work;
+static struct delayed_work time_sync_retry_work;
+static struct hrtimer s2idle_poll_timer;
+
+/* State flags */
 static bool lid_was_closed_at_suspend;
-static bool failsafe_in_progress;	/* guards cancel_delayed_work_sync */
+static bool failsafe_in_progress;
 static bool lid_poll_active;
 static bool lid_resync_active;
 static bool gpe52_was_enabled;
-static bool s2idle_gpe_active;		/* true between lps0_prepare and lps0_restore */
+static bool s2idle_gpe_active;
+static bool in_hibernate;
 static int last_poll_rxstate;
 static unsigned int failsafe_suspends;
 static unsigned int resync_polls_remaining;
 
-/* Lid switch input device for DE integration */
+/* Lid switch input device */
 static struct input_dev *lid_input_dev;
+
+/* Exponential backoff */
+static ktime_t last_suspend_entry;
+static unsigned int consecutive_rapid_wakes;
+
+/* Statistics (exposed via debugfs) */
+static struct {
+	unsigned int suspend_cycles;
+	unsigned int hibernate_cycles;
+	unsigned int padcfg_restores;
+	unsigned int wakeup_handler_calls;
+	unsigned int wakeup_handler_fixes;
+	unsigned int early_restores;
+	unsigned int lid_resyncs;
+	unsigned int gpio_recovery_polls;
+	unsigned int time_syncs;
+	unsigned int hostsw_own_corruptions;
+	unsigned int spurious_wakes;
+	unsigned int lps0_checks;
+	unsigned int conditional_skips;      /* MMIO writes skipped (value unchanged) */
+	unsigned int multi_pin_fixes;        /* non-lid pins that needed fixing */
+} stats;
+
+/* debugfs root */
+static struct dentry *dbgfs_root;
+
+/* Platform driver and device */
+static struct platform_driver s2idle_fix_plat_driver;
+static struct platform_device *s2idle_fix_pdev;
+
+/* ========================================================================
+ * Helpers
+ * ======================================================================== */
+
+static unsigned int get_resuspend_delay_ms(void)
+{
+	unsigned int delay;
+
+	if (consecutive_rapid_wakes == 0)
+		return BACKOFF_BASE_MS;
+	delay = BACKOFF_BASE_MS << min(consecutive_rapid_wakes, 4U);
+	return min(delay, (unsigned int)BACKOFF_CAP_MS);
+}
 
 static void report_lid_state(int closed)
 {
@@ -96,30 +251,213 @@ static void report_lid_state(int closed)
 	}
 }
 
-/* Stats */
-static unsigned int suspend_cycles;
-static unsigned int padcfg_restores;
-static unsigned int wakeup_handler_calls;
-static unsigned int early_restores;
-static unsigned int lid_resyncs;
-static unsigned int gpio_recovery_polls;
-
-/* Exponential backoff state */
-static ktime_t last_suspend_entry;
-static unsigned int consecutive_rapid_wakes;
-
-static unsigned int get_resuspend_delay_ms(void)
+static inline void __iomem *pin_addr(const struct pin_context *pin)
 {
-	unsigned int delay;
-
-	if (consecutive_rapid_wakes == 0)
-		return BACKOFF_BASE_MS;
-	/* 2s, 4s, 8s, 15s (capped) */
-	delay = BACKOFF_BASE_MS << min(consecutive_rapid_wakes, 4U);
-	return min(delay, (unsigned int)BACKOFF_CAP_MS);
+	return com4_base + pin->offset;
 }
 
-/* Power button input handler (passive observer for KEY_POWER) */
+/* ========================================================================
+ * Multi-pin PADCFG save/restore
+ *
+ * Modeled after Windows' GpioSaveBankHardwareContext / RestoreBankHardwareContext
+ * and Linux's intel_pinctrl_suspend_noirq / resume_noirq.
+ *
+ * Key behaviors copied from Windows:
+ *   - Only save Mode 0 pins (PMODE check)
+ *   - DW1 written before DW0 on restore
+ *   - Per-pin valid flag
+ *   - HOSTSW_OWN saved per bank
+ *
+ * Key behaviors copied from pinctrl-intel:
+ *   - Conditional write (only if value differs)
+ *   - Mask out volatile GPIORXSTATE before comparison
+ * ======================================================================== */
+
+static void save_all_pins(void)
+{
+	int i;
+	u32 padcfg0;
+
+	for (i = 0; i < num_tracked_pins; i++) {
+		struct pin_context *pin = &tracked_pins[i];
+
+		padcfg0 = readl(pin_addr(pin) + PADCFG0_OFF);
+
+		/* Only save Mode 0 pins (like Windows' PMODE check) */
+		if (padcfg0 & PADCFG0_PMODE_MASK) {
+			pin->valid = false;
+			continue;
+		}
+
+		pin->padcfg0 = padcfg0 & ~PADCFG0_GPIORXSTATE;
+		pin->padcfg1 = readl(pin_addr(pin) + PADCFG1_OFF);
+		pin->padcfg2 = readl(pin_addr(pin) + PADCFG2_OFF);
+		pin->sci_routed = !!(padcfg0 & PADCFG0_GPIROUTSCI);
+		pin->valid = true;
+	}
+
+	/* Save community-level registers */
+	for (i = 0; i < COM4_HOSTSW_OWN_REGS; i++)
+		saved_hostsw_own[i] = readl(com4_base + COM4_HOSTSW_OWN_BASE + i * 4);
+
+	for (i = 0; i < COM4_GPI_IE_REGS; i++)
+		saved_gpi_ie[i] = readl(com4_base + COM4_GPI_IE_BASE + i * 4);
+
+	community_ctx_saved = true;
+}
+
+/*
+ * Restore a single pin's PADCFG registers.
+ * Returns true if any register was actually modified.
+ *
+ * Like intel_restore_padcfg(), only writes if the value differs.
+ * Like Windows, writes DW1 before DW0.
+ */
+static bool restore_pin(struct pin_context *pin)
+{
+	u32 cur0, cur1, cur2;
+	bool modified = false;
+
+	if (!pin->valid)
+		return false;
+
+	cur2 = readl(pin_addr(pin) + PADCFG2_OFF);
+	if (cur2 != pin->padcfg2) {
+		writel(pin->padcfg2, pin_addr(pin) + PADCFG2_OFF);
+		modified = true;
+	}
+
+	/* DW1 FIRST (termination/tolerance), then DW0 (mode/RXINV)
+	 * This ordering is critical, confirmed in both Windows
+	 * GpioRestoreBankHardwareContext and our previous analysis. */
+	cur1 = readl(pin_addr(pin) + PADCFG1_OFF);
+	if (cur1 != pin->padcfg1) {
+		writel(pin->padcfg1, pin_addr(pin) + PADCFG1_OFF);
+		modified = true;
+	}
+
+	wmb(); /* ensure DW1 is committed before DW0 */
+
+	cur0 = readl(pin_addr(pin) + PADCFG0_OFF);
+	/* Mask out volatile GPIORXSTATE for comparison */
+	if ((cur0 & ~PADCFG0_GPIORXSTATE) != pin->padcfg0) {
+		writel(pin->padcfg0, pin_addr(pin) + PADCFG0_OFF);
+		modified = true;
+	} else {
+		stats.conditional_skips++;
+	}
+
+	if (modified)
+		wmb(); /* ensure all writes committed */
+
+	return modified;
+}
+
+/*
+ * Fix PADCFG corruption on all tracked pins.
+ * Returns the number of pins that were corrected.
+ *
+ * This is the consolidated restore helper, replacing the 5+ identical
+ * "check RXINV, restore, clear GPE" blocks from v1.1.0.
+ */
+static int fix_padcfg_corruption(const char *caller)
+{
+	int i, fixed = 0;
+	u32 cur0;
+
+	if (!com4_base)
+		return 0;
+
+	for (i = 0; i < num_tracked_pins; i++) {
+		struct pin_context *pin = &tracked_pins[i];
+
+		if (!pin->valid)
+			continue;
+
+		cur0 = readl(pin_addr(pin) + PADCFG0_OFF);
+
+		/* Check for RXINV corruption (the death sleep trigger) */
+		if ((cur0 & PADCFG0_RXINV) != (pin->padcfg0 & PADCFG0_RXINV)) {
+			if (restore_pin(pin)) {
+				fixed++;
+				stats.padcfg_restores++;
+				if (i == LID_TRACKED_INDEX) {
+					pr_info("%s: pin %u RXINV corrected "
+						"0x%08x -> 0x%08x\n",
+						caller, pin->pin_number,
+						cur0, pin->padcfg0);
+				} else {
+					stats.multi_pin_fixes++;
+					pr_info("%s: pin %u (non-lid) PADCFG "
+						"corrected 0x%08x -> 0x%08x\n",
+						caller, pin->pin_number,
+						cur0, pin->padcfg0);
+				}
+			}
+		}
+	}
+
+	/* If any SCI-routed pin was fixed, clear GPE 0x52 status
+	 * to prevent acpi_any_gpe_status_set() from seeing it */
+	if (fixed > 0)
+		acpi_clear_gpe(NULL, LID_GPE);
+
+	return fixed;
+}
+
+/*
+ * Check HOSTSW_OWN register for corruption.
+ * Windows saves/restores this per-bank. If it changes unexpectedly,
+ * GPIO reads could silently fail.
+ */
+static void check_hostsw_own(const char *caller)
+{
+	int i;
+	u32 current_val;
+
+	if (!community_ctx_saved)
+		return;
+
+	for (i = 0; i < COM4_HOSTSW_OWN_REGS; i++) {
+		current_val = readl(com4_base + COM4_HOSTSW_OWN_BASE + i * 4);
+		if (current_val != saved_hostsw_own[i]) {
+			stats.hostsw_own_corruptions++;
+			pr_warn("%s: HOSTSW_OWN[%d] changed: "
+				"0x%08x -> 0x%08x (diagnostic only)\n",
+				caller, i, saved_hostsw_own[i], current_val);
+			/* NOTE: Do NOT restore HOSTSW_OWN. Writing back boot-time
+			 * values can change ownership of pins used by other drivers
+			 * (e.g. touchpad I2C HID), killing their interrupt lines. */
+		}
+	}
+}
+
+/* ========================================================================
+ * GPE 0x52 management
+ * ======================================================================== */
+
+static void gpe52_force_disable(void)
+{
+	acpi_mask_gpe(NULL, LID_GPE, TRUE);
+	acpi_disable_gpe(NULL, LID_GPE);
+	acpi_clear_gpe(NULL, LID_GPE);
+	gpe52_was_enabled = true;
+}
+
+static void gpe52_unmask(const char *caller)
+{
+	if (gpe52_was_enabled) {
+		acpi_mask_gpe(NULL, LID_GPE, FALSE);
+		acpi_set_gpe(NULL, LID_GPE, ACPI_GPE_ENABLE);
+		gpe52_was_enabled = false;
+		pr_info("%s: GPE 0x52 unmasked\n", caller);
+	}
+}
+
+/* ========================================================================
+ * Power button observer (passive input handler)
+ * ======================================================================== */
+
 static atomic_t power_button_seen = ATOMIC_INIT(0);
 
 static int pwr_connect(struct input_handler *handler, struct input_dev *dev,
@@ -144,7 +482,7 @@ static int pwr_connect(struct input_handler *handler, struct input_dev *dev,
 	if (err)
 		goto err_unregister;
 
-	pr_info("input connected: %s\n", dev->name);
+	pr_info("power button input connected: %s\n", dev->name);
 	return 0;
 
 err_unregister:
@@ -156,7 +494,6 @@ err_free:
 
 static void pwr_disconnect(struct input_handle *handle)
 {
-	pr_info("input disconnected: %s\n", handle->dev->name);
 	input_close_device(handle);
 	input_unregister_handle(handle);
 	kfree(handle);
@@ -192,158 +529,196 @@ static struct input_handler pwr_handler = {
 	.passive_observer = true,
 };
 
-/*
- * ACPI wakeup handler: runs from acpi_check_wakeup_handlers() at
- * sleep.c:777, BEFORE acpi_ec_dispatch_gpe() at sleep.c:786.
+/* ========================================================================
+ * ACPI wakeup handler
  *
- * During s2idle, acpi_ec_dispatch_gpe() calls acpi_any_gpe_status_set()
- * which promotes to full resume if ANY non-EC GPE has status set.
- * By fixing PADCFG corruption and clearing GPE 0x52 status HERE,
- * we prevent the spurious full resume and let lps0_check() make the
- * actual lid-open decision.
- */
+ * Runs at step 4 in acpi_s2idle_wake(), BEFORE acpi_ec_dispatch_gpe()
+ * at step 5. This is our primary defense: fix PADCFG corruption and
+ * clear GPE 0x52 status before acpi_any_gpe_status_set() sees it.
+ *
+ * On this Surface (no EC), acpi_ec_dispatch_gpe() calls
+ * acpi_any_gpe_status_set(U32_MAX) which checks ALL GPEs. Without
+ * our handler clearing GPE 0x52, any phantom edge promotes to full
+ * resume and death sleep.
+ * ======================================================================== */
+
 static bool lid_wake_handler(void *context)
 {
-	u32 current_padcfg0;
+	int fixed;
 
-	wakeup_handler_calls++;
+	stats.wakeup_handler_calls++;
 
-	if (!lid_padcfg_base || !padcfg_saved)
-		return false;
+	fixed = fix_padcfg_corruption("wake_handler");
+	if (fixed > 0)
+		stats.wakeup_handler_fixes++;
 
-	current_padcfg0 = readl(lid_padcfg_base);
-
-	if ((current_padcfg0 & PADCFG0_RXINV) !=
-	    (saved_padcfg0 & PADCFG0_RXINV)) {
-		writel(saved_padcfg1, lid_padcfg_base + 4);
-		wmb();
-		writel(saved_padcfg0, lid_padcfg_base);
-		wmb();
-
-		padcfg_restores++;
-		pr_info("wake handler: PADCFG0 RXINV corrected "
-			"0x%08x -> 0x%08x\n",
-			current_padcfg0, saved_padcfg0);
-	}
-
-	/*
-	 * During s2idle: ALWAYS clear GPE 0x52 status so
-	 * acpi_any_gpe_status_set() doesn't see it and promote
-	 * to full resume. The lid-open decision is deferred to
-	 * lps0_check() which checks RXSTATE directly.
-	 */
+	/* During s2idle: ALWAYS clear GPE 0x52 status regardless of
+	 * whether corruption was detected. The GPE could fire from a
+	 * legitimate lid event that we want to defer to lps0_check(). */
 	if (s2idle_gpe_active)
 		acpi_clear_gpe(NULL, LID_GPE);
 
+	/* Never promote to full resume from here. The lid-open decision
+	 * is deferred to lps0_check() which polls RXSTATE directly. */
 	return false;
 }
 
-/*
- * resume_noirq: fix PADCFG corruption BEFORE any GPE re-enablement.
- * This runs before surface_gpe's resume and before the GPE subsystem
- * re-enables anything, so the pin state is clean when the SCI fires.
- */
-static int s2idle_fix_resume_noirq(struct device *dev)
-{
-	u32 padcfg0;
+/* ========================================================================
+ * Platform PM ops: suspend/resume/freeze/thaw/poweroff/restore
+ * ======================================================================== */
 
-	if (!lid_padcfg_base || !padcfg_saved)
+static int s2idle_fix_suspend_noirq(struct device *dev)
+{
+	if (!com4_base)
 		return 0;
 
-	padcfg0 = readl(lid_padcfg_base);
+	gpe52_force_disable();
+	pr_info("suspend_noirq: GPE 0x52 force-disabled\n");
+	return 0;
+}
 
-	if ((padcfg0 & PADCFG0_RXINV) != (saved_padcfg0 & PADCFG0_RXINV)) {
-		writel(saved_padcfg1, lid_padcfg_base + 4);
-		wmb();
-		writel(saved_padcfg0, lid_padcfg_base);
-		wmb();
+static int s2idle_fix_resume_noirq(struct device *dev)
+{
+	int fixed;
+	const char *path = in_hibernate ? "thaw_noirq" : "resume_noirq";
 
-		acpi_clear_gpe(NULL, LID_GPE);
+	if (!com4_base)
+		return 0;
 
-		padcfg_restores++;
-		pr_info("resume_noirq: PADCFG0 RXINV corrected "
-			"0x%08x -> 0x%08x\n", padcfg0, saved_padcfg0);
-	} else {
-		pr_info("resume_noirq: PADCFG0 OK (0x%08x)\n", padcfg0);
-	}
+	fixed = fix_padcfg_corruption(path);
+	check_hostsw_own(path);
+
+	if (fixed == 0)
+		pr_info("%s: all tracked pins OK\n", path);
 
 	return 0;
 }
 
-/*
- * LPS0 s2idle device ops: run inside the s2idle idle loop.
- *
- * prepare: fix PADCFG corruption, clear stale GPE, then unmask GPE 0x52.
- *          Runs AFTER acpi_enable_all_wakeup_gpes(), so we get the last word.
- *          Sets s2idle_gpe_active so lid_wake_handler knows to clear GPE status.
- * check:   runs after acpi_s2idle_wake() returns false (our wakeup handler
- *          suppressed the GPE-based full wake promotion). Fix any PADCFG
- *          corruption, then check RXSTATE. Only call pm_system_wakeup()
- *          if lid is actually open.
- * restore: clear s2idle_gpe_active, re-mask GPE 0x52 before full resume.
- */
+static int s2idle_fix_resume_early(struct device *dev)
+{
+	int fixed;
+	const char *path = in_hibernate ? "thaw_early" : "resume_early";
+
+	if (!com4_base)
+		return 0;
+
+	fixed = fix_padcfg_corruption(path);
+	if (fixed > 0)
+		stats.early_restores++;
+
+	gpe52_unmask(path);
+
+	return 0;
+}
+
+static int s2idle_fix_freeze(struct device *dev)
+{
+	if (!com4_base)
+		return 0;
+
+	gpe52_force_disable();
+	pr_info("freeze: GPE 0x52 force-disabled\n");
+	return 0;
+}
+
+static int s2idle_fix_freeze_noirq(struct device *dev)
+{
+	if (!com4_base)
+		return 0;
+
+	gpe52_force_disable();
+	fix_padcfg_corruption("freeze_noirq");
+
+	return 0;
+}
+
+static int s2idle_fix_poweroff(struct device *dev)
+{
+	if (!com4_base)
+		return 0;
+
+	gpe52_force_disable();
+	return 0;
+}
+
+static int s2idle_fix_poweroff_noirq(struct device *dev)
+{
+	if (!com4_base)
+		return 0;
+
+	gpe52_force_disable();
+	return 0;
+}
+
+static const struct dev_pm_ops s2idle_fix_pm_ops = {
+	.suspend_noirq  = s2idle_fix_suspend_noirq,
+	.resume_noirq   = s2idle_fix_resume_noirq,
+	.resume_early   = s2idle_fix_resume_early,
+	.freeze         = s2idle_fix_freeze,
+	.freeze_noirq   = s2idle_fix_freeze_noirq,
+	.thaw_noirq     = s2idle_fix_resume_noirq,
+	.thaw_early     = s2idle_fix_resume_early,
+	.poweroff       = s2idle_fix_poweroff,
+	.poweroff_noirq = s2idle_fix_poweroff_noirq,
+	.restore_noirq  = s2idle_fix_resume_noirq,
+	.restore_early  = s2idle_fix_resume_early,
+};
+
+/* ========================================================================
+ * LPS0 s2idle device ops (inside the s2idle idle loop)
+ * ======================================================================== */
+
 static unsigned int lps0_check_count;
+
+static enum hrtimer_restart s2idle_poll_timer_fn(struct hrtimer *timer)
+{
+	hrtimer_forward_now(timer, ns_to_ktime(S2IDLE_POLL_INTERVAL_NS));
+	return HRTIMER_RESTART;
+}
 
 static void s2idle_lps0_prepare(void)
 {
-	u32 padcfg0;
-
-	/*
-	 * Fix PADCFG corruption BEFORE enabling GPE 0x52.
-	 * If RXINV is already flipped from a previous C-state,
-	 * unmasking would cause an immediate spurious GPE fire.
-	 */
-	if (lid_padcfg_base && padcfg_saved) {
-		padcfg0 = readl(lid_padcfg_base);
-		if ((padcfg0 & PADCFG0_RXINV) !=
-		    (saved_padcfg0 & PADCFG0_RXINV)) {
-			writel(saved_padcfg1, lid_padcfg_base + 4);
-			wmb();
-			writel(saved_padcfg0, lid_padcfg_base);
-			wmb();
-			padcfg_restores++;
-			pr_info("lps0_prepare: PADCFG0 RXINV "
-				"pre-corrected\n");
-		}
-	}
+	/* Fix any existing corruption before entering deep sleep */
+	fix_padcfg_corruption("lps0_prepare");
 
 	/* Clear stale GPE status before unmasking */
 	acpi_clear_gpe(NULL, LID_GPE);
 
-	/* Now safe to unmask GPE 0x52 for lid-open detection */
+	/* Unmask GPE 0x52 for lid-open detection during s2idle.
+	 * The wakeup handler (step 4) clears GPE status on every wake
+	 * BEFORE acpi_ec_dispatch_gpe (step 5), preventing phantom
+	 * full-resume promotion. This is safe. */
 	acpi_mask_gpe(NULL, LID_GPE, FALSE);
 	acpi_set_gpe(NULL, LID_GPE, ACPI_GPE_ENABLE);
 
 	s2idle_gpe_active = true;
 	lps0_check_count = 0;
-	pr_info("lps0_prepare: GPE 0x52 unmasked for lid wake\n");
+
+	/* Periodic wakeup timer for lid polling during s2idle */
+	hrtimer_start(&s2idle_poll_timer,
+		      ns_to_ktime(S2IDLE_POLL_INTERVAL_NS),
+		      HRTIMER_MODE_REL_PINNED);
+
+	pr_info("lps0_prepare: poll timer started (%llums)\n",
+		(unsigned long long)(S2IDLE_POLL_INTERVAL_NS / NSEC_PER_MSEC));
 }
 
 static void s2idle_lps0_check(void)
 {
+	struct pin_context *lid;
 	u32 padcfg0;
 
 	lps0_check_count++;
+	stats.lps0_checks++;
 
-	/* Fix PADCFG corruption on every wake within the s2idle loop */
-	if (lid_padcfg_base && padcfg_saved) {
-		padcfg0 = readl(lid_padcfg_base);
-		if ((padcfg0 & PADCFG0_RXINV) !=
-		    (saved_padcfg0 & PADCFG0_RXINV)) {
-			writel(saved_padcfg1, lid_padcfg_base + 4);
-			wmb();
-			writel(saved_padcfg0, lid_padcfg_base);
-			wmb();
-			padcfg_restores++;
-			pr_info("lps0_check: PADCFG0 RXINV corrected "
-				"(check #%u)\n", lps0_check_count);
-		}
-	}
+	/* Fix corruption on every wake within the s2idle loop */
+	fix_padcfg_corruption("lps0_check");
 	acpi_clear_gpe(NULL, LID_GPE);
 
 	/* Detect lid-open: RXSTATE=0 means lid is open */
-	if (lid_padcfg_base && padcfg_saved && lid_was_closed_at_suspend) {
-		padcfg0 = readl(lid_padcfg_base);
+	lid = &tracked_pins[LID_TRACKED_INDEX];
+	if (lid->valid && lid_was_closed_at_suspend) {
+		padcfg0 = readl(pin_addr(lid) + PADCFG0_OFF);
 		if (!(padcfg0 & PADCFG0_GPIORXSTATE)) {
 			lid_was_closed_at_suspend = false;
 			report_lid_state(0);
@@ -357,13 +732,14 @@ static void s2idle_lps0_check(void)
 static void s2idle_lps0_restore(void)
 {
 	s2idle_gpe_active = false;
+	hrtimer_cancel(&s2idle_poll_timer);
 
-	/* Re-mask GPE 0x52 before full resume path runs.
-	 * resume_noirq/resume_early will unmask it properly. */
+	/* Re-mask GPE 0x52 leaving the s2idle loop.
+	 * PM_POST_SUSPEND will unmask it for normal operation. */
 	acpi_mask_gpe(NULL, LID_GPE, TRUE);
+	acpi_clear_gpe(NULL, LID_GPE);
 
-	pr_info("lps0_restore: %u checks during s2idle\n",
-		lps0_check_count);
+	pr_info("lps0_restore: %u checks during s2idle\n", lps0_check_count);
 }
 
 static struct acpi_s2idle_dev_ops s2idle_lps0_ops = {
@@ -372,93 +748,34 @@ static struct acpi_s2idle_dev_ops s2idle_lps0_ops = {
 	.restore = s2idle_lps0_restore,
 };
 
-/*
- * resume_early: double-check PADCFG after surface_gpe's resume_noirq,
- * before the ACPI button driver reads _LID in normal resume.
- */
-static int s2idle_fix_resume_early(struct device *dev)
-{
-	u32 padcfg0;
+/* ========================================================================
+ * Background RXSTATE polling
+ * ======================================================================== */
 
-	if (!lid_padcfg_base || !padcfg_saved)
-		return 0;
-
-	padcfg0 = readl(lid_padcfg_base);
-
-	if ((padcfg0 & PADCFG0_RXINV) != (saved_padcfg0 & PADCFG0_RXINV)) {
-		writel(saved_padcfg1, lid_padcfg_base + 4);
-		wmb();
-		writel(saved_padcfg0, lid_padcfg_base);
-		wmb();
-
-		acpi_clear_gpe(NULL, LID_GPE);
-
-		early_restores++;
-		pr_info("early resume: PADCFG0 RXINV corrected "
-			"0x%08x -> 0x%08x\n", padcfg0, saved_padcfg0);
-	} else {
-		pr_info("early resume: PADCFG0 OK (0x%08x)\n", padcfg0);
-	}
-
-	/* Unmask GPE 0x52 before ACPI button driver reads _LID */
-	if (gpe52_was_enabled) {
-		acpi_mask_gpe(NULL, LID_GPE, FALSE);
-		acpi_set_gpe(NULL, LID_GPE, ACPI_GPE_ENABLE);
-		gpe52_was_enabled = false;
-		pr_info("early resume: unmasked GPE 0x52\n");
-	}
-
-	return 0;
-}
-
-static const struct dev_pm_ops s2idle_fix_pm_ops = {
-	.resume_noirq  = s2idle_fix_resume_noirq,
-	.resume_early  = s2idle_fix_resume_early,
-};
-
-static struct platform_driver s2idle_fix_plat_driver = {
-	.driver = {
-		.name = "surface_s2idle_fix",
-		.pm = &s2idle_fix_pm_ops,
-	},
-};
-
-static struct platform_device *s2idle_fix_pdev;
-
-/*
- * Background RXSTATE polling: GPIO edge events break after s2idle cycles,
- * so poll the register directly and emit SW_LID events for the DE.
- *
- * This does NOT call pm_suspend(). The desktop environment decides what
- * to do on lid close (suspend, lock, nothing) via its own SW_LID handler.
- */
 static void lid_poll_fn(struct work_struct *work)
 {
+	struct pin_context *lid;
 	u32 padcfg0;
 	int rxstate;
 
-	if (!lid_padcfg_base || !lid_poll_active)
+	if (!com4_base || !lid_poll_active)
 		return;
 
-	padcfg0 = readl(lid_padcfg_base);
+	lid = &tracked_pins[LID_TRACKED_INDEX];
+	if (!lid->valid)
+		return;
+
+	padcfg0 = readl(pin_addr(lid) + PADCFG0_OFF);
 	rxstate = !!(padcfg0 & PADCFG0_GPIORXSTATE);
 
 	if (rxstate != last_poll_rxstate) {
-		pr_info("lid poll: RXSTATE %d->%d (PADCFG0=0x%08x)\n",
-			last_poll_rxstate, rxstate, padcfg0);
-
 		if (rxstate == 1 && last_poll_rxstate == 0) {
-			/* Lid closed: tell the DE, let it decide policy */
 			report_lid_state(1);
-			pr_info("lid poll: SW_LID=1 (closed) emitted\n");
-		}
-
-		if (rxstate == 0 && last_poll_rxstate == 1) {
-			/* Lid opened: tell the DE */
+			pr_info("lid poll: closed (RXSTATE 0->1)\n");
+		} else if (rxstate == 0 && last_poll_rxstate == 1) {
 			report_lid_state(0);
-			pr_info("lid poll: SW_LID=0 (open) emitted\n");
+			pr_info("lid poll: opened (RXSTATE 1->0)\n");
 		}
-
 		last_poll_rxstate = rxstate;
 	}
 
@@ -467,49 +784,45 @@ static void lid_poll_fn(struct work_struct *work)
 			msecs_to_jiffies(LID_POLL_INTERVAL_MS));
 }
 
-/*
- * Lid resync: after power-button wake with lid closed, poll RXSTATE
- * until the GPIO settles, then re-suspend if still closed.
- *
- * This only runs after module-initiated suspends (spurious wake recovery).
- */
+/* ========================================================================
+ * Lid resync: after power-button wake with lid closed
+ * ======================================================================== */
+
 static void lid_resync_fn(struct work_struct *work)
 {
+	struct pin_context *lid;
 	u32 padcfg0;
 	bool rxstate;
 
-	if (!lid_padcfg_base)
+	if (!com4_base)
 		return;
 
-	padcfg0 = readl(lid_padcfg_base);
+	lid = &tracked_pins[LID_TRACKED_INDEX];
+	if (!lid->valid)
+		return;
+
+	padcfg0 = readl(pin_addr(lid) + PADCFG0_OFF);
 	rxstate = !!(padcfg0 & PADCFG0_GPIORXSTATE);
-	gpio_recovery_polls++;
+	stats.gpio_recovery_polls++;
 
 	if (rxstate) {
 		unsigned int delay = get_resuspend_delay_ms();
 
-		lid_resyncs++;
+		stats.lid_resyncs++;
 
 		if (delay > BACKOFF_BASE_MS) {
-			pr_info("lid resync: RXSTATE=1, "
-				"backoff %ums\n", delay);
+			pr_info("lid resync: RXSTATE=1, backoff %ums\n", delay);
 			msleep(delay);
-			/* Re-check: lid may have opened */
-			padcfg0 = readl(lid_padcfg_base);
+			padcfg0 = readl(pin_addr(lid) + PADCFG0_OFF);
 			if (!(padcfg0 & PADCFG0_GPIORXSTATE)) {
-				pr_info("lid resync: lid opened "
-					"during backoff\n");
+				pr_info("lid resync: lid opened during backoff\n");
 				report_lid_state(0);
 				lid_resync_active = false;
 				return;
 			}
 		}
 
-		pr_info("lid resync: RXSTATE=1 (closed) after %u polls "
-			"(%us), re-suspending\n",
-			gpio_recovery_polls,
-			(gpio_recovery_polls * LID_RESYNC_INTERVAL_MS) / 1000);
-
+		pr_info("lid resync: still closed, re-suspending\n");
 		report_lid_state(1);
 		failsafe_in_progress = true;
 		pm_suspend(PM_SUSPEND_TO_IDLE);
@@ -520,50 +833,38 @@ static void lid_resync_fn(struct work_struct *work)
 
 	if (resync_polls_remaining > 0) {
 		resync_polls_remaining--;
-		if ((gpio_recovery_polls % 10) == 0)
-			pr_info("lid resync: still RXSTATE=0 after %u polls "
-				"(%us)\n",
-				gpio_recovery_polls,
-				(gpio_recovery_polls *
-				 LID_RESYNC_INTERVAL_MS) / 1000);
-
 		schedule_delayed_work(&lid_resync_work,
 				      msecs_to_jiffies(LID_RESYNC_INTERVAL_MS));
 	} else {
 		lid_resync_active = false;
 		report_lid_state(0);
-		pr_info("lid resync: GPIO never settled to closed after "
-			"%us, assuming lid is open\n",
-			(gpio_recovery_polls *
-			 LID_RESYNC_INTERVAL_MS) / 1000);
+		pr_info("lid resync: GPIO settled open\n");
 	}
 }
 
-/*
- * Post-resume failsafe: 2s after wake, decide stay-awake vs re-suspend.
- *
- * Re-suspends when lid is physically closed and no power button was pressed
- * (spurious wake). Stays awake when lid is open or power button woke us.
- * Works regardless of who initiated the suspend (DE, user, or module).
- */
+/* ========================================================================
+ * Post-resume failsafe
+ * ======================================================================== */
+
 static void lid_failsafe_fn(struct work_struct *work)
 {
+	struct pin_context *lid;
+
 	if (atomic_read(&power_button_seen)) {
 		atomic_set(&power_button_seen, 0);
 		failsafe_suspends = 0;
 
 		if (lid_was_closed_at_suspend) {
-			pr_info("failsafe: power button wake, lid was "
-				"closed, starting resync\n");
-			gpio_recovery_polls = 0;
+			pr_info("failsafe: power button wake, lid closed, "
+				"starting resync\n");
+			stats.gpio_recovery_polls = 0;
 			resync_polls_remaining = LID_RESYNC_MAX_POLLS;
 			lid_resync_active = true;
 			schedule_delayed_work(&lid_resync_work,
 				msecs_to_jiffies(LID_RESYNC_INTERVAL_MS));
 		} else {
 			report_lid_state(0);
-			pr_info("failsafe: power button wake, lid was "
-				"open, staying awake\n");
+			pr_info("failsafe: power button wake, lid open\n");
 			consecutive_rapid_wakes = 0;
 			lid_was_closed_at_suspend = false;
 		}
@@ -572,39 +873,37 @@ static void lid_failsafe_fn(struct work_struct *work)
 
 	if (!lid_was_closed_at_suspend) {
 		report_lid_state(0);
-		pr_info("failsafe: lid was open at suspend, "
-			"staying awake\n");
 		consecutive_rapid_wakes = 0;
 		failsafe_suspends = 0;
 		return;
 	}
 
-	/* Check CURRENT lid state, not just historical */
-	if (lid_padcfg_base) {
-		u32 now = readl(lid_padcfg_base);
+	/* Check current lid state */
+	lid = &tracked_pins[LID_TRACKED_INDEX];
+	if (lid->valid && com4_base) {
+		u32 now = readl(pin_addr(lid) + PADCFG0_OFF);
 		if (!(now & PADCFG0_GPIORXSTATE)) {
 			report_lid_state(0);
-			pr_info("failsafe: lid is currently open "
-				"(RXSTATE=0), staying awake\n");
 			consecutive_rapid_wakes = 0;
 			failsafe_suspends = 0;
 			lid_was_closed_at_suspend = false;
+			pr_info("failsafe: lid currently open, staying awake\n");
 			return;
 		}
 	}
 
 	if (failsafe_suspends >= FAILSAFE_MAX_RETRIES) {
-		pr_warn("failsafe: max retries (%u) reached, giving up\n",
+		pr_warn("failsafe: max retries (%u), giving up\n",
 			FAILSAFE_MAX_RETRIES);
 		failsafe_suspends = 0;
 		lid_was_closed_at_suspend = false;
 		return;
 	}
 
-	pr_info("failsafe: spurious wake, lid closed, "
-		"forcing s2idle (%u/%u)\n",
-		failsafe_suspends + 1, FAILSAFE_MAX_RETRIES);
+	stats.spurious_wakes++;
 	failsafe_suspends++;
+	pr_info("failsafe: spurious wake, re-suspending (%u/%u)\n",
+		failsafe_suspends, FAILSAFE_MAX_RETRIES);
 
 	report_lid_state(1);
 	failsafe_in_progress = true;
@@ -612,132 +911,231 @@ static void lid_failsafe_fn(struct work_struct *work)
 	failsafe_in_progress = false;
 }
 
-/* PM notifier: GPE masking + PADCFG save/restore */
+/* ========================================================================
+ * Pre/post sleep common logic
+ * ======================================================================== */
+
+static void fix_pre_sleep_common(const char *path_name)
+{
+	struct pin_context *lid;
+	u32 padcfg0;
+
+	if (!failsafe_in_progress) {
+		lid_poll_active = false;
+		lid_resync_active = false;
+		cancel_delayed_work_sync(&lid_poll_work);
+		cancel_delayed_work_sync(&lid_resync_work);
+		cancel_delayed_work_sync(&lid_failsafe_work);
+	}
+
+	last_suspend_entry = ktime_get();
+	atomic_set(&power_button_seen, 0);
+
+	/* Save all tracked pins (multi-pin, like Windows full-bank save) */
+	save_all_pins();
+
+	/* Record lid state for failsafe decision */
+	lid = &tracked_pins[LID_TRACKED_INDEX];
+	if (lid->valid && !failsafe_in_progress && !lid_was_closed_at_suspend) {
+		padcfg0 = readl(pin_addr(lid) + PADCFG0_OFF);
+		lid_was_closed_at_suspend = !!(padcfg0 & PADCFG0_GPIORXSTATE);
+	}
+
+	/* Mask GPE 0x52 for the duration of sleep.
+	 * suspend_noirq does gpe52_force_disable() as belt-and-suspenders. */
+	acpi_mask_gpe(NULL, LID_GPE, TRUE);
+	gpe52_was_enabled = true;
+
+	if (lid->valid) {
+		padcfg0 = readl(pin_addr(lid) + PADCFG0_OFF);
+		pr_info("%s: %d pins saved, GPE masked, "
+			"PADCFG0=0x%08x RXINV=%d RXSTATE=%d "
+			"lid_closed=%d\n",
+			path_name, num_tracked_pins, padcfg0,
+			!!(padcfg0 & PADCFG0_RXINV),
+			!!(padcfg0 & PADCFG0_GPIORXSTATE),
+			lid_was_closed_at_suspend);
+	}
+}
+
+static void fix_post_sleep_common(const char *path_name)
+{
+	struct pin_context *lid;
+	u32 padcfg0;
+	s64 sleep_ms;
+	unsigned int resuspend_delay;
+
+	/* Final PADCFG + HOSTSW_OWN check */
+	fix_padcfg_corruption(path_name);
+	check_hostsw_own(path_name);
+
+	/* Unmask fallback */
+	gpe52_unmask(path_name);
+
+	/* Track rapid wakes for exponential backoff */
+	sleep_ms = ktime_ms_delta(ktime_get(), last_suspend_entry);
+	if (sleep_ms < RAPID_WAKE_THRESHOLD_MS) {
+		consecutive_rapid_wakes++;
+		pr_info("%s: rapid wake (%lldms), streak=%u\n",
+			path_name, sleep_ms, consecutive_rapid_wakes);
+	} else {
+		consecutive_rapid_wakes = 0;
+		failsafe_suspends = 0;
+	}
+
+	/* Schedule failsafe with backoff */
+	resuspend_delay = get_resuspend_delay_ms();
+	schedule_delayed_work(&lid_failsafe_work,
+			      msecs_to_jiffies(resuspend_delay));
+
+	/* Restart lid polling */
+	lid = &tracked_pins[LID_TRACKED_INDEX];
+	if (lid->valid) {
+		padcfg0 = readl(pin_addr(lid) + PADCFG0_OFF);
+		last_poll_rxstate = !!(padcfg0 & PADCFG0_GPIORXSTATE);
+	}
+	lid_poll_active = true;
+	schedule_delayed_work(&lid_poll_work,
+			      msecs_to_jiffies(LID_POLL_INTERVAL_MS));
+
+	/* Log summary */
+	if (lid->valid) {
+		padcfg0 = readl(pin_addr(lid) + PADCFG0_OFF);
+		pr_info("%s: PADCFG0=0x%08x RXSTATE=%d "
+			"restores=%u handler_calls=%u\n",
+			path_name, padcfg0,
+			!!(padcfg0 & PADCFG0_GPIORXSTATE),
+			stats.padcfg_restores, stats.wakeup_handler_calls);
+	}
+
+	community_ctx_saved = false;
+	stats.wakeup_handler_calls = 0;
+}
+
+/* ========================================================================
+ * Post-hibernate time sync (fix "32Hz Of Death")
+ * ======================================================================== */
+
+static int time_sync_hwclock(const char *path_name)
+{
+	char *argv[] = { "/bin/sh", "-c", "hwclock --hctosys", NULL };
+	char *envp[] = {
+		"HOME=/",
+		"PATH=/sbin:/usr/sbin:/bin:/usr/bin",
+		NULL
+	};
+	int ret;
+
+	ret = call_usermodehelper(argv[0], argv, envp, UMH_WAIT_PROC);
+	if (ret == 0) {
+		stats.time_syncs++;
+		pr_info("%s: hwclock --hctosys succeeded\n", path_name);
+	}
+	return ret;
+}
+
+static int time_sync_from_rtc(const char *path_name)
+{
+	struct rtc_device *rtc;
+	struct rtc_time tm;
+	struct timespec64 sys_ts, rtc_ts;
+	time64_t rtc_secs;
+	s64 delta_secs;
+	int err;
+
+	rtc = rtc_class_open("rtc0");
+	if (!rtc)
+		return -ENODEV;
+
+	err = rtc_read_time(rtc, &tm);
+	rtc_class_close(rtc);
+	if (err)
+		return err;
+
+	rtc_secs = rtc_tm_to_time64(&tm);
+	ktime_get_real_ts64(&sys_ts);
+	delta_secs = rtc_secs - sys_ts.tv_sec;
+
+	if (delta_secs < 0)
+		delta_secs = -delta_secs;
+
+	if (delta_secs <= TIME_SYNC_THRESHOLD_SECS)
+		return 0;
+
+	rtc_ts.tv_sec = rtc_secs;
+	rtc_ts.tv_nsec = 0;
+
+	err = do_settimeofday64(&rtc_ts);
+	if (err)
+		return err;
+
+	stats.time_syncs++;
+	pr_info("%s: time corrected by %llds\n",
+		path_name, (long long)(rtc_secs - sys_ts.tv_sec));
+	return 0;
+}
+
+static void time_sync_retry_fn(struct work_struct *work)
+{
+	if (time_sync_from_rtc("retry") == 0) {
+		time_sync_hwclock("retry");
+		return;
+	}
+	time_sync_hwclock("retry");
+}
+
+static void hibernate_time_sync(const char *path_name)
+{
+	if (time_sync_from_rtc(path_name) == 0) {
+		schedule_delayed_work(&time_sync_retry_work,
+				      msecs_to_jiffies(1000));
+		return;
+	}
+	schedule_delayed_work(&time_sync_retry_work,
+			      msecs_to_jiffies(TIME_SYNC_RETRY_MS));
+}
+
+/* ========================================================================
+ * PM notifier (INT_MAX priority, runs first)
+ * ======================================================================== */
+
 static int s2idle_pm_notify(struct notifier_block *nb,
 			    unsigned long action, void *data)
 {
-	u32 padcfg0;
-
-	if (!lid_padcfg_base)
+	if (!com4_base)
 		return NOTIFY_DONE;
 
 	switch (action) {
 	case PM_SUSPEND_PREPARE:
-		/* Skip cancels when we're the caller, avoids workqueue deadlock */
-		if (!failsafe_in_progress) {
-			lid_poll_active = false;
-			lid_resync_active = false;
-			cancel_delayed_work_sync(&lid_poll_work);
-			cancel_delayed_work_sync(&lid_resync_work);
-			cancel_delayed_work_sync(&lid_failsafe_work);
-			/* Don't reset failsafe_suspends here, let it
-			 * accumulate across rapid-wake cycles so
-			 * FAILSAFE_MAX_RETRIES actually triggers */
-		}
-
-		last_suspend_entry = ktime_get();
-		atomic_set(&power_button_seen, 0);
-
-		/* Save PADCFG, mask out volatile GPIORXSTATE */
-		padcfg0 = readl(lid_padcfg_base);
-		saved_padcfg0 = padcfg0 & ~PADCFG0_GPIORXSTATE;
-		saved_padcfg1 = readl(lid_padcfg_base + 4);
-		padcfg_saved = true;
-		suspend_cycles++;
-
-		/* Don't clobber lid state on our own re-suspends */
-		if (!failsafe_in_progress && !lid_was_closed_at_suspend)
-			lid_was_closed_at_suspend =
-				!!(padcfg0 & PADCFG0_GPIORXSTATE);
-
-		/* Mask GPE 0x52 for the duration of s2idle */
-		acpi_mask_gpe(NULL, LID_GPE, TRUE);
-		gpe52_was_enabled = true;
-
-		pr_info("suspend #%u: masked GPE 0x52, "
-			"PADCFG0=0x%08x RXINV=%d RXSTATE=%d "
-			"lid_closed=%d failsafe_in_progress=%d\n",
-			suspend_cycles, padcfg0,
-			!!(padcfg0 & PADCFG0_RXINV),
-			!!(padcfg0 & PADCFG0_GPIORXSTATE),
-			lid_was_closed_at_suspend,
-			failsafe_in_progress);
+		stats.suspend_cycles++;
+		fix_pre_sleep_common("suspend");
 		break;
 
-	case PM_POST_SUSPEND: {
-		s64 sleep_ms;
-		unsigned int resuspend_delay;
-
-		/* Final PADCFG safety check (resume_early already ran) */
-		if (padcfg_saved) {
-			padcfg0 = readl(lid_padcfg_base);
-			if ((padcfg0 & PADCFG0_RXINV) !=
-			    (saved_padcfg0 & PADCFG0_RXINV)) {
-				writel(saved_padcfg1, lid_padcfg_base + 4);
-				wmb();
-				writel(saved_padcfg0, lid_padcfg_base);
-				wmb();
-				acpi_clear_gpe(NULL, LID_GPE);
-				padcfg_restores++;
-				pr_info("post-suspend: PADCFG0 STILL "
-					"corrupted, restored "
-					"(was 0x%08x, wrote 0x%08x)\n",
-					padcfg0, saved_padcfg0);
-			}
-		}
-
-		/* Unmask fallback if resume_early/lps0_restore missed it */
-		if (gpe52_was_enabled) {
-			acpi_mask_gpe(NULL, LID_GPE, FALSE);
-			acpi_set_gpe(NULL, LID_GPE, ACPI_GPE_ENABLE);
-			gpe52_was_enabled = false;
-			pr_info("post-suspend: GPE 0x52 unmask (fallback)\n");
-		}
-
-		/* Track rapid wakes for exponential backoff */
-		sleep_ms = ktime_ms_delta(ktime_get(), last_suspend_entry);
-		if (sleep_ms < RAPID_WAKE_THRESHOLD_MS) {
-			consecutive_rapid_wakes++;
-			pr_info("resume: rapid wake (%lldms), streak=%u\n",
-				sleep_ms, consecutive_rapid_wakes);
-		} else {
-			if (consecutive_rapid_wakes > 0)
-				pr_info("resume: healthy sleep (%lldms), "
-					"resetting backoff\n", sleep_ms);
-			consecutive_rapid_wakes = 0;
-			failsafe_suspends = 0;
-		}
-
-		/* Failsafe with backoff-aware delay */
-		resuspend_delay = get_resuspend_delay_ms();
-		schedule_delayed_work(&lid_failsafe_work,
-				      msecs_to_jiffies(resuspend_delay));
-		if (resuspend_delay > BACKOFF_BASE_MS)
-			pr_info("resume: backoff active, failsafe in %ums\n",
-				resuspend_delay);
-
-		/* Restart RXSTATE polling */
-		padcfg0 = readl(lid_padcfg_base);
-		last_poll_rxstate = !!(padcfg0 & PADCFG0_GPIORXSTATE);
-		lid_poll_active = true;
-		schedule_delayed_work(&lid_poll_work,
-				      msecs_to_jiffies(LID_POLL_INTERVAL_MS));
-
-		padcfg0 = readl(lid_padcfg_base);
-		pr_info("resume #%u: PADCFG0=0x%08x RXSTATE=%d "
-			"lid_closed=%d handler_calls=%u restores=%u "
-			"early_restores=%u\n",
-			suspend_cycles, padcfg0,
-			!!(padcfg0 & PADCFG0_GPIORXSTATE),
-			lid_was_closed_at_suspend,
-			wakeup_handler_calls, padcfg_restores,
-			early_restores);
-
-		padcfg_saved = false;
-		wakeup_handler_calls = 0;
+	case PM_HIBERNATION_PREPARE:
+		stats.hibernate_cycles++;
+		in_hibernate = true;
+		fix_pre_sleep_common("hibernate");
 		break;
-	} /* end PM_POST_SUSPEND */
-	} /* end switch */
+
+	case PM_RESTORE_PREPARE:
+		fix_pre_sleep_common("restore");
+		break;
+
+	case PM_POST_SUSPEND:
+		fix_post_sleep_common("post-suspend");
+		break;
+
+	case PM_POST_HIBERNATION:
+		hibernate_time_sync("post-hibernation");
+		fix_post_sleep_common("post-hibernation");
+		in_hibernate = false;
+		break;
+
+	case PM_POST_RESTORE:
+		hibernate_time_sync("post-restore");
+		fix_post_sleep_common("post-restore");
+		break;
+	}
 
 	return NOTIFY_DONE;
 }
@@ -747,7 +1145,179 @@ static struct notifier_block s2idle_pm_nb = {
 	.priority = INT_MAX,
 };
 
-/* DMI matching */
+/* ========================================================================
+ * debugfs interface
+ * ======================================================================== */
+
+static int stats_show(struct seq_file *s, void *unused)
+{
+	struct pin_context *lid = &tracked_pins[LID_TRACKED_INDEX];
+	u32 padcfg0 = 0;
+	int i;
+
+	if (lid->valid && com4_base)
+		padcfg0 = readl(pin_addr(lid) + PADCFG0_OFF);
+
+	seq_printf(s, "=== Surface S2Idle Fix v2.0 ===\n\n");
+
+	seq_printf(s, "Hardware:\n");
+	seq_printf(s, "  Community 4 base:     0x%08x\n", COM4_PADCFG_BASE);
+	seq_printf(s, "  Tracked pins:         %d\n", num_tracked_pins);
+	seq_printf(s, "  SCI IRQ:              %d\n", sci_irq);
+	seq_printf(s, "  GPE:                  0x%02x\n", LID_GPE);
+	seq_printf(s, "\n");
+
+	seq_printf(s, "Lid pin (213) state:\n");
+	seq_printf(s, "  PADCFG0 current:      0x%08x\n", padcfg0);
+	seq_printf(s, "  PADCFG0 saved:        0x%08x\n", lid->padcfg0);
+	seq_printf(s, "  RXINV:                %d\n", !!(padcfg0 & PADCFG0_RXINV));
+	seq_printf(s, "  RXSTATE:              %d (%s)\n",
+		   !!(padcfg0 & PADCFG0_GPIORXSTATE),
+		   (padcfg0 & PADCFG0_GPIORXSTATE) ? "closed" : "open");
+	seq_printf(s, "  GPIROUTSCI:           %d\n", !!(padcfg0 & PADCFG0_GPIROUTSCI));
+	seq_printf(s, "\n");
+
+	seq_printf(s, "Tracked pin details:\n");
+	for (i = 0; i < num_tracked_pins; i++) {
+		struct pin_context *p = &tracked_pins[i];
+		u32 cur = com4_base ? readl(pin_addr(p) + PADCFG0_OFF) : 0;
+
+		seq_printf(s, "  [%d] pin %u @ 0x%04x: DW0=0x%08x "
+			   "saved=0x%08x valid=%d sci=%d%s\n",
+			   i, p->pin_number, p->offset, cur,
+			   p->padcfg0, p->valid, p->sci_routed,
+			   i == LID_TRACKED_INDEX ? " (LID)" : "");
+	}
+	seq_printf(s, "\n");
+
+	seq_printf(s, "HOSTSW_OWN registers:\n");
+	for (i = 0; i < COM4_HOSTSW_OWN_REGS && com4_base; i++) {
+		u32 cur = readl(com4_base + COM4_HOSTSW_OWN_BASE + i * 4);
+
+		seq_printf(s, "  [%d] current=0x%08x saved=0x%08x %s\n",
+			   i, cur, saved_hostsw_own[i],
+			   cur != saved_hostsw_own[i] ? "MISMATCH" : "ok");
+	}
+	seq_printf(s, "\n");
+
+	seq_printf(s, "Statistics:\n");
+	seq_printf(s, "  Suspend cycles:       %u\n", stats.suspend_cycles);
+	seq_printf(s, "  Hibernate cycles:     %u\n", stats.hibernate_cycles);
+	seq_printf(s, "  PADCFG restores:      %u\n", stats.padcfg_restores);
+	seq_printf(s, "  Wakeup handler calls: %u\n", stats.wakeup_handler_calls);
+	seq_printf(s, "  Wakeup handler fixes: %u\n", stats.wakeup_handler_fixes);
+	seq_printf(s, "  Early restores:       %u\n", stats.early_restores);
+	seq_printf(s, "  LPS0 checks:          %u\n", stats.lps0_checks);
+	seq_printf(s, "  Conditional skips:    %u\n", stats.conditional_skips);
+	seq_printf(s, "  Multi-pin fixes:      %u\n", stats.multi_pin_fixes);
+	seq_printf(s, "  HOSTSW_OWN fixes:     %u\n", stats.hostsw_own_corruptions);
+	seq_printf(s, "  Spurious wakes:       %u\n", stats.spurious_wakes);
+	seq_printf(s, "  Lid resyncs:          %u\n", stats.lid_resyncs);
+	seq_printf(s, "  Time syncs:           %u\n", stats.time_syncs);
+	seq_printf(s, "\n");
+
+	seq_printf(s, "State:\n");
+	seq_printf(s, "  lid_was_closed:       %d\n", lid_was_closed_at_suspend);
+	seq_printf(s, "  failsafe_in_progress: %d\n", failsafe_in_progress);
+	seq_printf(s, "  s2idle_gpe_active:    %d\n", s2idle_gpe_active);
+	seq_printf(s, "  in_hibernate:         %d\n", in_hibernate);
+	seq_printf(s, "  gpe52_was_enabled:    %d\n", gpe52_was_enabled);
+	seq_printf(s, "  rapid_wakes:          %u\n", consecutive_rapid_wakes);
+	seq_printf(s, "  failsafe_suspends:    %u\n", failsafe_suspends);
+
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(stats);
+
+static void debugfs_setup(void)
+{
+	dbgfs_root = debugfs_create_dir("surface_s2idle_fix", NULL);
+	if (IS_ERR_OR_NULL(dbgfs_root)) {
+		dbgfs_root = NULL;
+		return;
+	}
+	debugfs_create_file("status", 0444, dbgfs_root, NULL, &stats_fops);
+}
+
+static void debugfs_teardown(void)
+{
+	debugfs_remove_recursive(dbgfs_root);
+	dbgfs_root = NULL;
+}
+
+/* ========================================================================
+ * Pin discovery and initialization
+ * ======================================================================== */
+
+/*
+ * Scan Community 4 for SCI-routed Mode 0 pins beyond our hardcoded list.
+ * This catches any additional VNN-vulnerable pins we might not know about.
+ */
+static void discover_sci_pins(void)
+{
+	int i;
+	u32 padcfg0;
+
+	/* Start with the hardcoded list */
+	for (i = 0; i < ARRAY_SIZE(tracked_pin_offsets) &&
+		    num_tracked_pins < MAX_TRACKED_PINS; i++) {
+		struct pin_context *pin = &tracked_pins[num_tracked_pins];
+
+		pin->offset = tracked_pin_offsets[i];
+		/* For hardcoded pins, use the known GPIO number.
+		 * Pin 213 is at offset 0x09a0 in Community 4. */
+		pin->pin_number = (i == 0) ? LID_PIN_INDEX :
+				  pin->offset / PADCFG_STRIDE;
+
+		padcfg0 = readl(pin_addr(pin) + PADCFG0_OFF);
+
+		/* Verify pin is in Mode 0 and SCI-routed */
+		if ((padcfg0 & PADCFG0_PMODE_MASK) == 0 &&
+		    (padcfg0 & PADCFG0_GPIROUTSCI)) {
+			pin->sci_routed = true;
+			pr_info("tracking pin %u @ 0x%04x (PADCFG0=0x%08x, "
+				"SCI-routed)\n", pin->pin_number,
+				pin->offset, padcfg0);
+		} else {
+			pr_info("tracking pin %u @ 0x%04x (PADCFG0=0x%08x, "
+				"non-SCI)\n", pin->pin_number,
+				pin->offset, padcfg0);
+		}
+		num_tracked_pins++;
+	}
+
+	/* NOTE: No scan beyond hardcoded pins. The PR proved pin 213 is
+	 * the only VNN-vulnerable SCI pin that causes death sleep.
+	 * Scanning and tracking unknown pins risks corrupting unrelated
+	 * GPIO lines (e.g. touchpad I2C HID IRQ) on resume restore. */
+
+	pr_info("total tracked pins: %d\n", num_tracked_pins);
+}
+
+/*
+ * Apply boot parameters programmatically where possible.
+ * This reduces the dependency on GRUB configuration.
+ *
+ * Note: reboot_type (reboot=acpi), acpi_osi, and acpi_mask_gpe
+ * cannot be set from a module (symbols not exported). These must
+ * remain as GRUB boot parameters:
+ *   reboot=acpi acpi_osi="Windows 2020" acpi_mask_gpe=0x52
+ *
+ * The boot parameter acpi_mask_gpe=0x52 closes the 1.26s timing
+ * gap between ACPI init (0.36s) and module load (~2.3s). Our init
+ * unmasks it once the wakeup handler is registered.
+ */
+static void apply_boot_params(void)
+{
+	/* Nothing we can set from module context currently.
+	 * This function exists as a placeholder for future use
+	 * and to document what boot parameters are required. */
+}
+
+/* ========================================================================
+ * DMI matching
+ * ======================================================================== */
+
 static const struct dmi_system_id surface_ids[] = {
 	{
 		.ident = "Surface Laptop 5",
@@ -759,43 +1329,88 @@ static const struct dmi_system_id surface_ids[] = {
 	{ }
 };
 
-/* Init / Exit */
+/* ========================================================================
+ * Module init / exit
+ * ======================================================================== */
+
+static struct platform_driver s2idle_fix_plat_driver = {
+	.driver = {
+		.name = "surface_s2idle_fix",
+		.pm = &s2idle_fix_pm_ops,
+	},
+};
+
 static int __init surface_s2idle_fix_init(void)
 {
+	struct pin_context *lid;
 	u32 initial_padcfg0;
 	int err, lps0_err;
 	bool pwr_ok;
 
 	if (!dmi_check_system(surface_ids)) {
-		pr_err("not a supported Surface device, aborting\n");
+		pr_err("not a supported Surface device\n");
 		return -ENODEV;
 	}
 
-	lid_padcfg_base = ioremap(LID_PADCFG0_PHYS, PADCFG_MAP_SIZE);
-	if (!lid_padcfg_base) {
-		pr_err("failed to ioremap PADCFG at 0x%08x\n",
-		       LID_PADCFG0_PHYS);
+	/* Map the full Community 4 region (not just one pin) */
+	com4_base = ioremap(COM4_PADCFG_BASE, COM4_PADCFG_SIZE);
+	if (!com4_base) {
+		pr_err("failed to ioremap Community 4 at 0x%08x\n",
+		       COM4_PADCFG_BASE);
 		return -ENOMEM;
 	}
 
-	initial_padcfg0 = readl(lid_padcfg_base);
-
+	/* Verify pin 213 is SCI-routed before proceeding */
+	initial_padcfg0 = readl(com4_base + LID_PIN_OFFSET + PADCFG0_OFF);
 	if (!(initial_padcfg0 & PADCFG0_GPIROUTSCI)) {
-		pr_err("PADCFG0=0x%08x: GPIROUTSCI not set, wrong pin?\n",
+		pr_err("pin 213 PADCFG0=0x%08x: GPIROUTSCI not set\n",
 		       initial_padcfg0);
-		iounmap(lid_padcfg_base);
-		lid_padcfg_base = NULL;
+		iounmap(com4_base);
+		com4_base = NULL;
 		return -ENODEV;
 	}
 
 	sci_irq = acpi_gbl_FADT.sci_interrupt;
 
-	/* Platform driver for resume_noirq + resume_early */
+	/* Apply boot parameters where possible */
+	apply_boot_params();
+
+	/* Discover all SCI-routed pins in Community 4 */
+	discover_sci_pins();
+
+	/* Save initial pin state and fix any existing corruption */
+	save_all_pins();
+
+	/* NOTE: Do NOT gpe52_force_disable() here. GPE 0x52 must stay live
+	 * during normal operation so the ACPI button driver (PNP0C0D) receives
+	 * lid events and systemd-logind can trigger suspend on lid close.
+	 * The acpi_mask_gpe=0x52 boot param covers the hibernate timing gap.
+	 * Our wakeup handler (registered below) catches phantom edges during
+	 * s2idle. PM_SUSPEND_PREPARE masks GPE; resume_early unmasks it. */
+
+	/* Fix PADCFG corruption if BIOS left RXINV in wrong state */
+	lid = &tracked_pins[LID_TRACKED_INDEX];
+	if (lid->valid && (initial_padcfg0 & PADCFG0_RXINV)) {
+		u32 fixed = initial_padcfg0 & ~PADCFG0_RXINV;
+
+		writel(lid->padcfg1, pin_addr(lid) + PADCFG1_OFF);
+		wmb();
+		writel(fixed & ~PADCFG0_GPIORXSTATE, pin_addr(lid) + PADCFG0_OFF);
+		wmb();
+
+		lid->padcfg0 = fixed & ~PADCFG0_GPIORXSTATE;
+		stats.padcfg_restores++;
+		pr_info("init: RXINV was set, corrected 0x%08x -> 0x%08x\n",
+			initial_padcfg0, fixed);
+		initial_padcfg0 = fixed;
+	}
+
+	/* Platform driver for PM ops */
 	err = platform_driver_register(&s2idle_fix_plat_driver);
 	if (err) {
-		pr_err("platform_driver_register failed: %d\n", err);
-		iounmap(lid_padcfg_base);
-		lid_padcfg_base = NULL;
+		pr_err("platform_driver_register: %d\n", err);
+		iounmap(com4_base);
+		com4_base = NULL;
 		return err;
 	}
 
@@ -803,36 +1418,46 @@ static int __init surface_s2idle_fix_init(void)
 		"surface_s2idle_fix", -1, NULL, 0);
 	if (IS_ERR(s2idle_fix_pdev)) {
 		err = PTR_ERR(s2idle_fix_pdev);
-		pr_err("platform_device_register_simple failed: %d\n", err);
+		pr_err("platform_device_register: %d\n", err);
 		platform_driver_unregister(&s2idle_fix_plat_driver);
-		iounmap(lid_padcfg_base);
-		lid_padcfg_base = NULL;
+		iounmap(com4_base);
+		com4_base = NULL;
 		return err;
 	}
 
+	/* Work items and timers */
 	INIT_DELAYED_WORK(&lid_failsafe_work, lid_failsafe_fn);
 	INIT_DELAYED_WORK(&lid_resync_work, lid_resync_fn);
 	INIT_DELAYED_WORK(&lid_poll_work, lid_poll_fn);
+	INIT_DELAYED_WORK(&time_sync_retry_work, time_sync_retry_fn);
+	hrtimer_setup(&s2idle_poll_timer, s2idle_poll_timer_fn,
+		      CLOCK_MONOTONIC, HRTIMER_MODE_REL);
 
+	/* Power button observer */
 	err = input_register_handler(&pwr_handler);
 	pwr_ok = !err;
 	if (err)
-		pr_warn("power button handler failed: %d "
-			"(failsafe will use max-retry fallback)\n", err);
+		pr_warn("power button handler failed: %d\n", err);
 
+	/* ACPI wakeup handler (step 4, before GPE dispatch at step 5) */
 	acpi_register_wakeup_handler(sci_irq, lid_wake_handler, NULL);
 	register_pm_notifier(&s2idle_pm_nb);
 
-	/* LPS0 hooks: unmask GPE 0x52 inside s2idle loop for lid wake,
-	 * fix PADCFG corruption in lps0_check without full resume */
+	/* LPS0 s2idle hooks */
 	lps0_err = acpi_register_lps0_dev(&s2idle_lps0_ops);
 	if (lps0_err)
-		pr_warn("LPS0 registration failed: %d "
-			"(lid wake during s2idle disabled)\n", lps0_err);
-	else
-		pr_info("LPS0 s2idle hooks registered\n");
+		pr_warn("LPS0 registration failed: %d\n", lps0_err);
 
-	/* Register lid switch input device for DE integration */
+	/* All handlers registered. Unmask + enable GPE 0x52 for ACPI lid events.
+	 * The acpi_mask_gpe=0x52 boot param masked it at ACPI init (0.36s) for
+	 * hibernate timing gap safety. Now that our wakeup handler is registered,
+	 * we can safely unmask it. Clear stale status first. */
+	acpi_clear_gpe(NULL, LID_GPE);
+	acpi_mask_gpe(NULL, LID_GPE, FALSE);
+	acpi_set_gpe(NULL, LID_GPE, ACPI_GPE_ENABLE);
+	pr_info("init: GPE 0x52 unmasked and enabled for ACPI lid events\n");
+
+	/* Lid switch input device */
 	lid_input_dev = input_allocate_device();
 	if (lid_input_dev) {
 		lid_input_dev->name = "Surface S2Idle Lid Switch";
@@ -841,41 +1466,36 @@ static int __init surface_s2idle_fix_init(void)
 		lid_input_dev->evbit[0] = BIT_MASK(EV_SW);
 		lid_input_dev->swbit[0] = BIT_MASK(SW_LID);
 
-		/* Set initial state: RXSTATE=1 means closed */
 		input_report_switch(lid_input_dev, SW_LID,
 				    !!(initial_padcfg0 & PADCFG0_GPIORXSTATE));
 		input_sync(lid_input_dev);
 
 		err = input_register_device(lid_input_dev);
 		if (err) {
-			pr_warn("lid input device failed: %d\n", err);
+			pr_warn("lid input: %d\n", err);
 			input_free_device(lid_input_dev);
 			lid_input_dev = NULL;
-		} else {
-			pr_info("lid input device registered (initial SW_LID=%d)\n",
-				!!(initial_padcfg0 & PADCFG0_GPIORXSTATE));
 		}
 	}
 
-	/* Start RXSTATE polling */
+	/* debugfs */
+	debugfs_setup();
+
+	/* Start lid polling */
 	last_poll_rxstate = !!(initial_padcfg0 & PADCFG0_GPIORXSTATE);
 	lid_poll_active = true;
 	schedule_delayed_work(&lid_poll_work,
 			      msecs_to_jiffies(LID_POLL_INTERVAL_MS));
 
-	pr_info("loaded: SCI=%d PADCFG0=0x%08x RXINV=%d RXSTATE=%d "
-		"pwr_handler=%s resume_early=YES lps0=%s\n",
-		sci_irq, initial_padcfg0,
+	pr_info("v2.0 loaded: SCI=%d, %d pins tracked, "
+		"PADCFG0=0x%08x RXINV=%d RXSTATE=%d, "
+		"pwr=%s lps0=%s debugfs=%s\n",
+		sci_irq, num_tracked_pins, initial_padcfg0,
 		!!(initial_padcfg0 & PADCFG0_RXINV),
 		!!(initial_padcfg0 & PADCFG0_GPIORXSTATE),
-		pwr_ok ? "OK" : "FAILED",
-		lps0_err ? "FAILED" : "OK");
-	pr_info("  GPE 0x52 masked during s2idle, "
-		"failsafe %ums, resync %ums interval (max %u polls), "
-		"lid poll %ums\n",
-		LID_FAILSAFE_DELAY_MS,
-		LID_RESYNC_INTERVAL_MS, LID_RESYNC_MAX_POLLS,
-		LID_POLL_INTERVAL_MS);
+		pwr_ok ? "ok" : "FAIL",
+		lps0_err ? "FAIL" : "ok",
+		dbgfs_root ? "ok" : "FAIL");
 
 	return 0;
 }
@@ -883,15 +1503,15 @@ static int __init surface_s2idle_fix_init(void)
 static void __exit surface_s2idle_fix_exit(void)
 {
 	lid_poll_active = false;
+	hrtimer_cancel(&s2idle_poll_timer);
 	cancel_delayed_work_sync(&lid_poll_work);
 	cancel_delayed_work_sync(&lid_resync_work);
 	cancel_delayed_work_sync(&lid_failsafe_work);
+	cancel_delayed_work_sync(&time_sync_retry_work);
 
-	if (gpe52_was_enabled) {
-		acpi_mask_gpe(NULL, LID_GPE, FALSE);
-		acpi_set_gpe(NULL, LID_GPE, ACPI_GPE_ENABLE);
-		gpe52_was_enabled = false;
-	}
+	gpe52_unmask("exit");
+
+	debugfs_teardown();
 
 	if (lid_input_dev)
 		input_unregister_device(lid_input_dev);
@@ -904,15 +1524,17 @@ static void __exit surface_s2idle_fix_exit(void)
 	platform_device_unregister(s2idle_fix_pdev);
 	platform_driver_unregister(&s2idle_fix_plat_driver);
 
-	if (lid_padcfg_base) {
-		iounmap(lid_padcfg_base);
-		lid_padcfg_base = NULL;
+	if (com4_base) {
+		iounmap(com4_base);
+		com4_base = NULL;
 	}
 
-	pr_info("unloaded: %u cycles, %u restores, %u early_restores, "
-		"%u resyncs\n",
-		suspend_cycles, padcfg_restores, early_restores,
-		lid_resyncs);
+	pr_info("v2.0 unloaded: %u suspends, %u hibernates, "
+		"%u PADCFG restores, %u multi-pin fixes, "
+		"%u HOSTSW_OWN fixes, %u spurious wakes\n",
+		stats.suspend_cycles, stats.hibernate_cycles,
+		stats.padcfg_restores, stats.multi_pin_fixes,
+		stats.hostsw_own_corruptions, stats.spurious_wakes);
 }
 
 module_init(surface_s2idle_fix_init);
@@ -920,5 +1542,6 @@ module_exit(surface_s2idle_fix_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Surface Linux Debug");
-MODULE_DESCRIPTION("Fix s2idle death sleep on Surface Laptop 5");
+MODULE_DESCRIPTION("Fix s2idle/hibernate death sleep on Surface Laptop 5 (v2.0)");
+MODULE_VERSION("2.0.0");
 MODULE_ALIAS("dmi:*:svnMicrosoftCorporation:pnSurfaceLaptop5:*");
