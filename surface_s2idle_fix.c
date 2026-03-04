@@ -71,7 +71,7 @@
 #include <linux/ktime.h>
 #include <linux/delay.h>
 #include <linux/hrtimer.h>
-#include <linux/rtc.h>
+/* rtc.h removed: time sync now uses userspace hwclock + chronyc */
 #include <linux/umh.h>
 #include <linux/debugfs.h>
 #include <linux/seq_file.h>
@@ -175,8 +175,7 @@ static int sci_irq;
 #define BACKOFF_BASE_MS         2000
 #define BACKOFF_CAP_MS          15000
 #define S2IDLE_POLL_INTERVAL_NS (500 * NSEC_PER_MSEC)
-#define TIME_SYNC_THRESHOLD_SECS  2
-#define TIME_SYNC_RETRY_MS        5000
+#define TIME_SYNC_DELAY_MS        3000
 
 /* Work items and timers */
 static struct delayed_work lid_failsafe_work;
@@ -1014,11 +1013,17 @@ static void fix_post_sleep_common(const char *path_name)
 
 /* ========================================================================
  * Post-hibernate time sync (fix "32Hz Of Death")
+ *
+ * Strategy: don't try kernel-space do_settimeofday64() at all, it's fragile
+ * in PM notifier context and fails silently. Instead schedule userspace
+ * commands with a delay so /bin/sh and chronyc are available:
+ *   1) hwclock --hctosys --utc  (force system clock from hardware RTC)
+ *   2) chronyc makestep          (force NTP step-correct, not slew)
  * ======================================================================== */
 
-static int time_sync_hwclock(const char *path_name)
+static int run_cmd(const char *cmd, const char *caller)
 {
-	char *argv[] = { "/bin/sh", "-c", "hwclock --hctosys", NULL };
+	char *argv[] = { "/bin/sh", "-c", (char *)cmd, NULL };
 	char *envp[] = {
 		"HOME=/",
 		"PATH=/sbin:/usr/sbin:/bin:/usr/bin",
@@ -1027,72 +1032,21 @@ static int time_sync_hwclock(const char *path_name)
 	int ret;
 
 	ret = call_usermodehelper(argv[0], argv, envp, UMH_WAIT_PROC);
-	if (ret == 0) {
-		stats.time_syncs++;
-		pr_info("%s: hwclock --hctosys succeeded\n", path_name);
-	}
+	if (ret)
+		pr_warn("%s: '%s' failed (%d)\n", caller, cmd, ret);
+	else
+		pr_info("%s: '%s' ok\n", caller, cmd);
 	return ret;
-}
-
-static int time_sync_from_rtc(const char *path_name)
-{
-	struct rtc_device *rtc;
-	struct rtc_time tm;
-	struct timespec64 sys_ts, rtc_ts;
-	time64_t rtc_secs;
-	s64 delta_secs;
-	int err;
-
-	rtc = rtc_class_open("rtc0");
-	if (!rtc)
-		return -ENODEV;
-
-	err = rtc_read_time(rtc, &tm);
-	rtc_class_close(rtc);
-	if (err)
-		return err;
-
-	rtc_secs = rtc_tm_to_time64(&tm);
-	ktime_get_real_ts64(&sys_ts);
-	delta_secs = rtc_secs - sys_ts.tv_sec;
-
-	if (delta_secs < 0)
-		delta_secs = -delta_secs;
-
-	if (delta_secs <= TIME_SYNC_THRESHOLD_SECS)
-		return 0;
-
-	rtc_ts.tv_sec = rtc_secs;
-	rtc_ts.tv_nsec = 0;
-
-	err = do_settimeofday64(&rtc_ts);
-	if (err)
-		return err;
-
-	stats.time_syncs++;
-	pr_info("%s: time corrected by %llds\n",
-		path_name, (long long)(rtc_secs - sys_ts.tv_sec));
-	return 0;
 }
 
 static void time_sync_retry_fn(struct work_struct *work)
 {
-	if (time_sync_from_rtc("retry") == 0) {
-		time_sync_hwclock("retry");
-		return;
-	}
-	time_sync_hwclock("retry");
-}
+	/* Stage 1: force system clock from hardware RTC */
+	if (run_cmd("hwclock --hctosys --utc", "time_sync") == 0)
+		stats.time_syncs++;
 
-static void hibernate_time_sync(const char *path_name)
-{
-	if (time_sync_from_rtc(path_name) == 0) {
-		schedule_delayed_work(&time_sync_retry_work,
-				      msecs_to_jiffies(1000));
-		return;
-	}
-	schedule_delayed_work(&time_sync_retry_work,
-			      msecs_to_jiffies(TIME_SYNC_RETRY_MS));
+	/* Stage 2: force chrony to step-correct (not slew) */
+	run_cmd("chronyc makestep", "time_sync");
 }
 
 /* ========================================================================
@@ -1126,14 +1080,18 @@ static int s2idle_pm_notify(struct notifier_block *nb,
 		break;
 
 	case PM_POST_HIBERNATION:
-		hibernate_time_sync("post-hibernation");
 		fix_post_sleep_common("post-hibernation");
 		in_hibernate = false;
+		/* Schedule time sync after userspace is thawed and ready.
+		 * 3s delay ensures /bin/sh and chronyc are available. */
+		schedule_delayed_work(&time_sync_retry_work,
+				      msecs_to_jiffies(TIME_SYNC_DELAY_MS));
 		break;
 
 	case PM_POST_RESTORE:
-		hibernate_time_sync("post-restore");
 		fix_post_sleep_common("post-restore");
+		schedule_delayed_work(&time_sync_retry_work,
+				      msecs_to_jiffies(TIME_SYNC_DELAY_MS));
 		break;
 	}
 
