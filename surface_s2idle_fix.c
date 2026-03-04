@@ -71,7 +71,8 @@
 #include <linux/ktime.h>
 #include <linux/delay.h>
 #include <linux/hrtimer.h>
-/* rtc.h removed: time sync now uses userspace hwclock + chronyc */
+#include <linux/rtc.h>
+#include <linux/timekeeping.h>
 #include <linux/umh.h>
 #include <linux/debugfs.h>
 #include <linux/seq_file.h>
@@ -176,12 +177,14 @@ static int sci_irq;
 #define BACKOFF_CAP_MS          15000
 #define S2IDLE_POLL_INTERVAL_NS (500 * NSEC_PER_MSEC)
 #define TIME_SYNC_DELAY_MS        3000
+#define NTP_SYNC_DELAY_MS        15000
 
 /* Work items and timers */
 static struct delayed_work lid_failsafe_work;
 static struct delayed_work lid_resync_work;
 static struct delayed_work lid_poll_work;
 static struct delayed_work time_sync_retry_work;
+static struct delayed_work time_sync_ntp_work;
 static struct hrtimer s2idle_poll_timer;
 
 /* State flags */
@@ -192,6 +195,7 @@ static bool lid_resync_active;
 static bool gpe52_was_enabled;
 static bool s2idle_gpe_active;
 static bool in_hibernate;
+static struct timespec64 saved_pre_hibernate_ts;
 static int last_poll_rxstate;
 static unsigned int failsafe_suspends;
 static unsigned int resync_polls_remaining;
@@ -925,6 +929,7 @@ static void fix_pre_sleep_common(const char *path_name)
 		cancel_delayed_work_sync(&lid_poll_work);
 		cancel_delayed_work_sync(&lid_resync_work);
 		cancel_delayed_work_sync(&lid_failsafe_work);
+		cancel_delayed_work_sync(&time_sync_ntp_work);
 	}
 
 	last_suspend_entry = ktime_get();
@@ -957,7 +962,7 @@ static void fix_pre_sleep_common(const char *path_name)
 	}
 }
 
-static void fix_post_sleep_common(const char *path_name)
+static void fix_post_sleep_common(const char *path_name, bool schedule_work)
 {
 	struct pin_context *lid;
 	u32 padcfg0;
@@ -971,31 +976,34 @@ static void fix_post_sleep_common(const char *path_name)
 	/* Unmask fallback */
 	gpe52_unmask(path_name);
 
-	/* Track rapid wakes for exponential backoff */
-	sleep_ms = ktime_ms_delta(ktime_get(), last_suspend_entry);
-	if (sleep_ms < RAPID_WAKE_THRESHOLD_MS) {
-		consecutive_rapid_wakes++;
-		pr_info("%s: rapid wake (%lldms), streak=%u\n",
-			path_name, sleep_ms, consecutive_rapid_wakes);
-	} else {
-		consecutive_rapid_wakes = 0;
-		failsafe_suspends = 0;
-	}
-
-	/* Schedule failsafe with backoff */
-	resuspend_delay = get_resuspend_delay_ms();
-	schedule_delayed_work(&lid_failsafe_work,
-			      msecs_to_jiffies(resuspend_delay));
-
-	/* Restart lid polling */
 	lid = &tracked_pins[LID_TRACKED_INDEX];
-	if (lid->valid) {
-		padcfg0 = readl(pin_addr(lid) + PADCFG0_OFF);
-		last_poll_rxstate = !!(padcfg0 & PADCFG0_GPIORXSTATE);
+
+	if (schedule_work) {
+		/* Track rapid wakes for exponential backoff */
+		sleep_ms = ktime_ms_delta(ktime_get(), last_suspend_entry);
+		if (sleep_ms < RAPID_WAKE_THRESHOLD_MS) {
+			consecutive_rapid_wakes++;
+			pr_info("%s: rapid wake (%lldms), streak=%u\n",
+				path_name, sleep_ms, consecutive_rapid_wakes);
+		} else {
+			consecutive_rapid_wakes = 0;
+			failsafe_suspends = 0;
+		}
+
+		/* Schedule failsafe with backoff */
+		resuspend_delay = get_resuspend_delay_ms();
+		schedule_delayed_work(&lid_failsafe_work,
+				      msecs_to_jiffies(resuspend_delay));
+
+		/* Restart lid polling */
+		if (lid->valid) {
+			padcfg0 = readl(pin_addr(lid) + PADCFG0_OFF);
+			last_poll_rxstate = !!(padcfg0 & PADCFG0_GPIORXSTATE);
+		}
+		lid_poll_active = true;
+		schedule_delayed_work(&lid_poll_work,
+				      msecs_to_jiffies(LID_POLL_INTERVAL_MS));
 	}
-	lid_poll_active = true;
-	schedule_delayed_work(&lid_poll_work,
-			      msecs_to_jiffies(LID_POLL_INTERVAL_MS));
 
 	/* Log summary */
 	if (lid->valid) {
@@ -1041,12 +1049,89 @@ static int run_cmd(const char *cmd, const char *caller)
 
 static void time_sync_retry_fn(struct work_struct *work)
 {
-	/* Stage 1: force system clock from hardware RTC */
-	if (run_cmd("hwclock --hctosys --utc", "time_sync") == 0)
+	struct rtc_device *rtc;
+	struct rtc_time tm;
+	struct timespec64 rtc_ts, now_ts;
+	time64_t delta;
+
+	/* Step 1: Read RTC directly from hardware via kernel API.
+	 * This is the Linux analog of Windows' HalQueryRealTimeClock,
+	 * which ntoskrnl calls during hibernate resume before any
+	 * driver D0Entry callbacks. We do it here (3s delayed workqueue)
+	 * because Linux's timekeeping_resume() fails with acpi_sleep=nonvs. */
+	rtc = rtc_class_open("rtc0");
+	if (!rtc) {
+		pr_warn("time_sync: cannot open rtc0, falling back to userspace\n");
+		goto userspace_fallback;
+	}
+
+	if (rtc_read_time(rtc, &tm)) {
+		pr_warn("time_sync: rtc_read_time failed, falling back\n");
+		rtc_class_close(rtc);
+		goto userspace_fallback;
+	}
+	rtc_class_close(rtc);
+
+	rtc_ts.tv_sec = rtc_tm_to_time64(&tm);
+	rtc_ts.tv_nsec = 0;
+
+	/* Step 2: Delta sanity check against pre-hibernate timestamp.
+	 * If we saved a timestamp before hibernate, the RTC time should be
+	 * >= saved time (time moves forward) and < saved + 30 days.
+	 * This catches corrupt RTC values, negative time travel, firmware bugs. */
+	if (saved_pre_hibernate_ts.tv_sec > 0) {
+		delta = rtc_ts.tv_sec - saved_pre_hibernate_ts.tv_sec;
+		pr_info("time_sync: hibernate delta = %lld seconds\n", delta);
+		if (delta < 0 || delta > 2592000) {
+			pr_warn("time_sync: insane delta %lld, skipping kernel set\n",
+				delta);
+			goto userspace_fallback;
+		}
+	}
+
+	/* Step 3: Set system clock from kernel space.
+	 * This is the Linux equivalent of Windows' KeSetSystemTime. */
+	if (do_settimeofday64(&rtc_ts)) {
+		pr_warn("time_sync: do_settimeofday64 failed, falling back\n");
+		goto userspace_fallback;
+	}
+
+	/* Step 4: Verify it actually stuck by reading back */
+	ktime_get_real_ts64(&now_ts);
+	delta = now_ts.tv_sec - rtc_ts.tv_sec;
+	if (delta < -2 || delta > 2) {
+		pr_warn("time_sync: verify failed (drift=%llds), falling back\n",
+			delta);
+		goto userspace_fallback;
+	}
+
+	pr_info("time_sync: kernel-space RTC set OK (verified, drift=%llds)\n",
+		delta);
+	stats.time_syncs++;
+	goto display_fix;
+
+userspace_fallback:
+	/* Fallback: date -u -s from RTC sysfs.
+	 * If kernel-space somehow fails, this is plan B. */
+	if (run_cmd("date -u -s \"$(cat /sys/class/rtc/rtc0/date) "
+		    "$(cat /sys/class/rtc/rtc0/time)\"",
+		    "time_sync_fallback") == 0)
 		stats.time_syncs++;
 
-	/* Stage 2: force chrony to step-correct (not slew) */
-	run_cmd("chronyc makestep", "time_sync");
+display_fix:
+	/* Trigger i915 display state reconciliation.
+	 * Reading i915_display_info forces drm_modeset_lock_all() and
+	 * a hardware state re-read, fixing 32Hz eDP link after hibernate. */
+	run_cmd("cat /sys/kernel/debug/dri/0000:00:02.0/i915_display_info"
+		" > /dev/null 2>&1", "display_fix");
+}
+
+/* Stage 3: Delayed NTP step. chronyc makestep needs a selected source,
+ * which takes ~10s after hibernate resume (sources go offline during
+ * hibernate, need to re-poll). 15s delay ensures source selection. */
+static void time_sync_ntp_fn(struct work_struct *work)
+{
+	run_cmd("chronyc makestep", "ntp_sync");
 }
 
 /* ========================================================================
@@ -1068,6 +1153,7 @@ static int s2idle_pm_notify(struct notifier_block *nb,
 	case PM_HIBERNATION_PREPARE:
 		stats.hibernate_cycles++;
 		in_hibernate = true;
+		ktime_get_real_ts64(&saved_pre_hibernate_ts);
 		fix_pre_sleep_common("hibernate");
 		break;
 
@@ -1076,22 +1162,25 @@ static int s2idle_pm_notify(struct notifier_block *nb,
 		break;
 
 	case PM_POST_SUSPEND:
-		fix_post_sleep_common("post-suspend");
+		fix_post_sleep_common("post-suspend", true);
 		break;
 
 	case PM_POST_HIBERNATION:
-		fix_post_sleep_common("post-hibernation");
+		/* PM_POST_HIBERNATION fires after image write, BEFORE poweroff.
+		 * Do NOT schedule delayed work here, the machine is about to
+		 * shut down. Real resume fires PM_POST_RESTORE instead. */
+		fix_post_sleep_common("post-hibernation", false);
 		in_hibernate = false;
-		/* Schedule time sync after userspace is thawed and ready.
-		 * 3s delay ensures /bin/sh and chronyc are available. */
-		schedule_delayed_work(&time_sync_retry_work,
-				      msecs_to_jiffies(TIME_SYNC_DELAY_MS));
 		break;
 
 	case PM_POST_RESTORE:
-		fix_post_sleep_common("post-restore");
+		/* This is the REAL resume path after hibernate.
+		 * Schedule time sync and all delayed work here. */
+		fix_post_sleep_common("post-restore", true);
 		schedule_delayed_work(&time_sync_retry_work,
 				      msecs_to_jiffies(TIME_SYNC_DELAY_MS));
+		schedule_delayed_work(&time_sync_ntp_work,
+				      msecs_to_jiffies(NTP_SYNC_DELAY_MS));
 		break;
 	}
 
@@ -1388,6 +1477,7 @@ static int __init surface_s2idle_fix_init(void)
 	INIT_DELAYED_WORK(&lid_resync_work, lid_resync_fn);
 	INIT_DELAYED_WORK(&lid_poll_work, lid_poll_fn);
 	INIT_DELAYED_WORK(&time_sync_retry_work, time_sync_retry_fn);
+	INIT_DELAYED_WORK(&time_sync_ntp_work, time_sync_ntp_fn);
 	hrtimer_setup(&s2idle_poll_timer, s2idle_poll_timer_fn,
 		      CLOCK_MONOTONIC, HRTIMER_MODE_REL);
 
@@ -1466,6 +1556,7 @@ static void __exit surface_s2idle_fix_exit(void)
 	cancel_delayed_work_sync(&lid_resync_work);
 	cancel_delayed_work_sync(&lid_failsafe_work);
 	cancel_delayed_work_sync(&time_sync_retry_work);
+	cancel_delayed_work_sync(&time_sync_ntp_work);
 
 	gpe52_unmask("exit");
 

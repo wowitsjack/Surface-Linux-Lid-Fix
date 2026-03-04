@@ -1,8 +1,17 @@
+# Kernel build artifacts
 *.o
 *.ko
 *.mod
 *.mod.c
+*.mod.o
 *.cmd
-modules.order
 Module.symvers
+modules.order
+.module-common.o
 .tmp_versions/
+
+# Debug snapshots
+debug-snapshots/
+
+# Reverse engineering notes (local only)
+surface-re/
