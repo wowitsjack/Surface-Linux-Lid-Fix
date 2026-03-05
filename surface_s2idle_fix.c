@@ -77,6 +77,7 @@
 #include <linux/in.h>
 #include <net/sock.h>
 #include <linux/sched/signal.h>
+#include <linux/random.h>
 #include <linux/backlight.h>
 #include <linux/debugfs.h>
 #include <linux/seq_file.h>
@@ -924,6 +925,10 @@ static void lid_failsafe_fn(struct work_struct *work)
  * Pre/post sleep common logic
  * ======================================================================== */
 
+/* Forward declaration: thaw_chronyd is defined in the time sync section
+ * below, but needed here if NTP work is cancelled during pre-sleep. */
+static void thaw_chronyd(void);
+
 static void fix_pre_sleep_common(const char *path_name)
 {
 	struct pin_context *lid;
@@ -936,6 +941,9 @@ static void fix_pre_sleep_common(const char *path_name)
 		cancel_delayed_work_sync(&lid_resync_work);
 		cancel_delayed_work_sync(&lid_failsafe_work);
 		cancel_delayed_work_sync(&time_sync_ntp_work);
+		/* If NTP work was cancelled before it could thaw chronyd,
+		 * do it now so chronyd doesn't stay permanently SIGSTOP'd. */
+		thaw_chronyd();
 	}
 
 	last_suspend_entry = ktime_get();
@@ -1052,6 +1060,15 @@ static void freeze_chronyd(void)
 {
 	struct task_struct *task;
 
+	/* Guard against double-freeze: if we're already holding a pid ref
+	 * from a previous cycle (e.g. rapid hibernate before NTP work
+	 * could thaw), don't leak the old ref or re-SIGSTOP. */
+	if (frozen_chronyd_pid) {
+		pr_info("chronyd already frozen (pid %d), skipping\n",
+			pid_vnr(frozen_chronyd_pid));
+		return;
+	}
+
 	rcu_read_lock();
 	for_each_process(task) {
 		if (strcmp(task->comm, "chronyd") == 0) {
@@ -1070,11 +1087,18 @@ static void freeze_chronyd(void)
 
 static void thaw_chronyd(void)
 {
+	int ret;
+
 	if (!frozen_chronyd_pid)
 		return;
 
-	kill_pid(frozen_chronyd_pid, SIGCONT, 1);
-	pr_info("chronyd thawed (pid %d)\n", pid_vnr(frozen_chronyd_pid));
+	ret = kill_pid(frozen_chronyd_pid, SIGCONT, 1);
+	if (ret == -ESRCH)
+		pr_warn("chronyd (pid %d) exited while frozen\n",
+			pid_vnr(frozen_chronyd_pid));
+	else
+		pr_info("chronyd thawed (pid %d)\n",
+			pid_vnr(frozen_chronyd_pid));
 	put_pid(frozen_chronyd_pid);
 	frozen_chronyd_pid = NULL;
 }
@@ -1085,6 +1109,7 @@ static void thaw_chronyd(void)
 #define NTP_PACKET_SIZE		48
 #define NTP_PORT		123
 #define NTP_TIMEOUT_MS		3000
+#define NTP_MAX_OFFSET_SECS	3600	/* 1 hour: generous after RTC sync at +3s */
 
 /* Google Public NTP anycast IPs (time.google.com) */
 static const __be32 ntp_servers[] = {
@@ -1140,19 +1165,36 @@ static int kernel_ntp_query(struct timespec64 *ntp_time)
 	sock->sk->sk_rcvtimeo = msecs_to_jiffies(NTP_TIMEOUT_MS);
 
 	for (i = 0; i < ARRAY_SIZE(ntp_servers); i++) {
-		/* SNTP client request: LI=0, VN=4, Mode=3 */
-		memset(&request, 0, sizeof(request));
-		request.li_vn_mode = 0x23;
-
 		memset(&server, 0, sizeof(server));
 		server.sin_family = AF_INET;
 		server.sin_port = htons(NTP_PORT);
 		server.sin_addr.s_addr = ntp_servers[i];
 
-		/* Send */
+		/* Connect filters recv to only this server's IP:port.
+		 * UDP connect is lightweight (no handshake), just sets
+		 * a source filter. Prevents accepting spoofed packets
+		 * from arbitrary IPs on the ephemeral port. */
+		ret = kernel_connect(sock, (struct sockaddr *)&server,
+				     sizeof(server), 0);
+		if (ret) {
+			pr_warn("ntp_query: connect to server %d failed (%d)\n",
+				i, ret);
+			continue;
+		}
+
+		/* SNTP client request: LI=0, VN=4, Mode=3.
+		 * Set unique transmit timestamp for anti-spoofing:
+		 * server MUST echo it back as origin timestamp.
+		 * Forces attacker to observe actual request (on-path)
+		 * rather than blind injection. */
+		memset(&request, 0, sizeof(request));
+		request.li_vn_mode = 0x23;
+		request.xmit_ts_sec = htonl((u32)(ktime_get_real_seconds()
+					    + NTP_EPOCH_OFFSET));
+		request.xmit_ts_frac = htonl(get_random_u32());
+
+		/* Send on connected socket (no msg_name needed) */
 		memset(&msg, 0, sizeof(msg));
-		msg.msg_name = &server;
-		msg.msg_namelen = sizeof(server);
 		iov.iov_base = &request;
 		iov.iov_len = sizeof(request);
 
@@ -1163,7 +1205,7 @@ static int kernel_ntp_query(struct timespec64 *ntp_time)
 			continue;
 		}
 
-		/* Receive */
+		/* Receive (source-filtered by kernel_connect) */
 		memset(&response, 0, sizeof(response));
 		memset(&msg, 0, sizeof(msg));
 		iov.iov_base = &response;
@@ -1193,15 +1235,28 @@ static int kernel_ntp_query(struct timespec64 *ntp_time)
 			continue;
 		}
 
+		/* Anti-spoofing: server must echo our transmit timestamp
+		 * as the origin timestamp. Mismatch means either the
+		 * response doesn't correspond to our request (stale/spoofed)
+		 * or the server is non-compliant. */
+		if (response.orig_ts_sec != request.xmit_ts_sec ||
+		    response.orig_ts_frac != request.xmit_ts_frac) {
+			pr_warn("ntp_query: origin timestamp mismatch from "
+				"server %d (possible spoof)\n", i);
+			continue;
+		}
+
 		/* Extract server transmit timestamp, NTP epoch -> Unix epoch */
 		server_sec = (time64_t)ntohl(response.xmit_ts_sec)
 			     - NTP_EPOCH_OFFSET;
 
-		/* Sanity: NTP time should be within 30 days of local clock */
+		/* Sanity: NTP time should be within 1 hour of local clock.
+		 * After RTC sync at +3s, legitimate offset is seconds.
+		 * 1 hour is extremely generous for RTC crystal drift. */
 		diff = server_sec - t4.tv_sec;
-		if (diff < -2592000 || diff > 2592000) {
-			pr_warn("ntp_query: insane offset %llds from server %d\n",
-				diff, i);
+		if (diff < -NTP_MAX_OFFSET_SECS || diff > NTP_MAX_OFFSET_SECS) {
+			pr_warn("ntp_query: offset %llds exceeds %d from "
+				"server %d\n", diff, NTP_MAX_OFFSET_SECS, i);
 			continue;
 		}
 
@@ -1372,13 +1427,25 @@ static void time_sync_ntp_fn(struct work_struct *work)
 	struct timespec64 ntp_time, now;
 	struct rtc_device *rtc;
 	struct rtc_time tm;
+	s64 diff;
 
 	/* Query NTP ground truth via kernel UDP socket */
 	if (kernel_ntp_query(&ntp_time) == 0) {
+		/* Defense-in-depth: after RTC sync at +3s, NTP offset
+		 * should be small. Reject suspiciously large offsets
+		 * before persisting to settimeofday + RTC hardware. */
+		ktime_get_real_ts64(&now);
+		diff = ntp_time.tv_sec - now.tv_sec;
+		if (diff < -300 || diff > 300) {
+			pr_warn("ntp_sync: NTP offset %llds suspiciously "
+				"large after RTC sync, skipping\n", diff);
+			goto thaw;
+		}
+
 		/* Set system clock from NTP */
 		if (do_settimeofday64(&ntp_time) == 0) {
 			pr_info("ntp_sync: clock set from NTP "
-				"(offset %llds from RTC)\n",
+				"(hibernate duration ~%llds)\n",
 				ntp_time.tv_sec -
 				saved_pre_hibernate_ts.tv_sec);
 			stats.time_syncs++;
@@ -1406,7 +1473,8 @@ static void time_sync_ntp_fn(struct work_struct *work)
 		pr_warn("ntp_sync: NTP query failed, keeping RTC time\n");
 	}
 
-	/* Always thaw chronyd, even if NTP failed.
+thaw:
+	/* Always thaw chronyd, even if NTP failed or offset was rejected.
 	 * Chronyd sees the (now correct) clock and rebuilds its
 	 * tracking state from scratch via fresh NTP polls. */
 	thaw_chronyd();
