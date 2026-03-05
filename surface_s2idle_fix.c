@@ -196,6 +196,7 @@ static bool gpe52_was_enabled;
 static bool s2idle_gpe_active;
 static bool in_hibernate;
 static struct timespec64 saved_pre_hibernate_ts;
+static ktime_t saved_pre_hibernate_mono;
 static int last_poll_rxstate;
 static unsigned int failsafe_suspends;
 static unsigned int resync_polls_remaining;
@@ -1054,6 +1055,13 @@ static void time_sync_retry_fn(struct work_struct *work)
 	struct timespec64 rtc_ts, now_ts;
 	time64_t delta;
 
+	/* Step 0: Take chrony offline BEFORE touching the clock.
+	 * After hibernate, chrony's internal tracking state is stale (from
+	 * before hibernate). If we set the clock from RTC first, chrony
+	 * sees the "wrong" time and steps it BACKWARD by hours, causing
+	 * GDM/mutter to blank the display. Pausing chrony prevents this. */
+	run_cmd("chronyc offline", "time_sync_chrony_pause");
+
 	/* Step 1: Read RTC directly from hardware via kernel API.
 	 * This is the Linux analog of Windows' HalQueryRealTimeClock,
 	 * which ntoskrnl calls during hibernate resume before any
@@ -1124,6 +1132,13 @@ display_fix:
 	 * a hardware state re-read, fixing 32Hz eDP link after hibernate. */
 	run_cmd("cat /sys/kernel/debug/dri/0000:00:02.0/i915_display_info"
 		" > /dev/null 2>&1", "display_fix");
+
+	/* Restore backlight to max after display reconciliation.
+	 * The modeset lock + hardware re-read can momentarily blank the
+	 * display. Force backlight on via sysfs (works without X/Wayland). */
+	run_cmd("cat /sys/class/backlight/intel_backlight/max_brightness"
+		" > /sys/class/backlight/intel_backlight/brightness"
+		" 2>/dev/null", "backlight_restore");
 }
 
 /* Stage 3: Delayed NTP step. chronyc makestep needs a selected source,
@@ -1131,6 +1146,10 @@ display_fix:
  * hibernate, need to re-poll). 15s delay ensures source selection. */
 static void time_sync_ntp_fn(struct work_struct *work)
 {
+	/* Bring chrony back online (was taken offline in time_sync_retry_fn
+	 * to prevent backward clock step). 15s delay gives chrony time to
+	 * re-establish NTP source selection after hibernate resume. */
+	run_cmd("chronyc online", "ntp_sync");
 	run_cmd("chronyc makestep", "ntp_sync");
 }
 
@@ -1154,6 +1173,7 @@ static int s2idle_pm_notify(struct notifier_block *nb,
 		stats.hibernate_cycles++;
 		in_hibernate = true;
 		ktime_get_real_ts64(&saved_pre_hibernate_ts);
+		saved_pre_hibernate_mono = ktime_get();
 		fix_pre_sleep_common("hibernate");
 		break;
 
@@ -1165,22 +1185,80 @@ static int s2idle_pm_notify(struct notifier_block *nb,
 		fix_post_sleep_common("post-suspend", true);
 		break;
 
-	case PM_POST_HIBERNATION:
-		/* PM_POST_HIBERNATION fires after image write, BEFORE poweroff.
-		 * Do NOT schedule delayed work here, the machine is about to
-		 * shut down. Real resume fires PM_POST_RESTORE instead. */
-		fix_post_sleep_common("post-hibernation", false);
+	case PM_POST_HIBERNATION: {
+		/* PM_POST_HIBERNATION fires in BOTH paths:
+		 *   1) After image write + thaw, about to power off
+		 *   2) After successful hibernate resume (restored kernel)
+		 *
+		 * Detect which by comparing monotonic clock delta. During
+		 * poweroff, monotonic doesn't advance, so after resume the
+		 * delta since PM_HIBERNATION_PREPARE is tiny (<30s). On the
+		 * image-write path, it's just a few seconds too, BUT the
+		 * wall clock won't have jumped. After resume, wall clock
+		 * jumped hours/days (RTC kept counting while powered off). */
+		s64 mono_delta_ms = ktime_ms_delta(ktime_get(),
+						   saved_pre_hibernate_mono);
+		struct timespec64 now_real;
+		s64 real_delta;
+
+		ktime_get_real_ts64(&now_real);
+		real_delta = now_real.tv_sec - saved_pre_hibernate_ts.tv_sec;
+
+		/* Resume detection: monotonic barely moved but wall clock
+		 * jumped significantly (>60s). On image-write path both
+		 * deltas are small and similar. */
+		if (mono_delta_ms < 30000 && real_delta > 60) {
+			pr_info("post-hibernation: RESUME detected "
+				"(mono=%lldms, real=%llds)\n",
+				mono_delta_ms, real_delta);
+
+			fix_post_sleep_common("post-hibernate-resume", false);
+
+			/* Report current lid state to input layer.
+			 * logind watches our SW_LID device, stale state
+			 * from ACPI button driver can cause unwanted
+			 * suspend. */
+			{
+				struct pin_context *lid =
+					&tracked_pins[LID_TRACKED_INDEX];
+				if (lid->valid && com4_base) {
+					u32 padcfg0 = readl(
+						pin_addr(lid) + PADCFG0_OFF);
+					int rxstate = !!(padcfg0 &
+						PADCFG0_GPIORXSTATE);
+					report_lid_state(rxstate);
+					last_poll_rxstate = rxstate;
+					pr_info("post-hibernate-resume: "
+						"lid %s reported\n",
+						rxstate ? "closed" : "open");
+				}
+			}
+
+			/* Start lid poll (no failsafe for hibernate) */
+			lid_poll_active = true;
+			schedule_delayed_work(&lid_poll_work,
+				msecs_to_jiffies(LID_POLL_INTERVAL_MS));
+
+			/* Schedule time sync and NTP */
+			schedule_delayed_work(&time_sync_retry_work,
+				msecs_to_jiffies(TIME_SYNC_DELAY_MS));
+			schedule_delayed_work(&time_sync_ntp_work,
+				msecs_to_jiffies(NTP_SYNC_DELAY_MS));
+		} else {
+			pr_info("post-hibernation: pre-poweroff path "
+				"(mono=%lldms, real=%llds)\n",
+				mono_delta_ms, real_delta);
+			fix_post_sleep_common("post-hibernation", false);
+		}
+
 		in_hibernate = false;
 		break;
+	}
 
 	case PM_POST_RESTORE:
-		/* This is the REAL resume path after hibernate.
-		 * Schedule time sync and all delayed work here. */
-		fix_post_sleep_common("post-restore", true);
-		schedule_delayed_work(&time_sync_retry_work,
-				      msecs_to_jiffies(TIME_SYNC_DELAY_MS));
-		schedule_delayed_work(&time_sync_ntp_work,
-				      msecs_to_jiffies(NTP_SYNC_DELAY_MS));
+		/* PM_POST_RESTORE only fires when image restore FAILS
+		 * (boot kernel couldn't load the image). Just clean up. */
+		fix_post_sleep_common("post-restore-failed", false);
 		break;
 	}
 

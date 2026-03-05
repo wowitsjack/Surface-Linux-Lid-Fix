@@ -50,16 +50,30 @@ Handles `PM_SUSPEND_PREPARE`, `PM_POST_SUSPEND`, `PM_HIBERNATION_PREPARE`, `PM_P
 - When `schedule_work=true`: tracks rapid wakes, schedules lid failsafe/poll work
 - When `schedule_work=false`: skips all work scheduling (used during post-image poweroff path)
 
-**PM_POST_HIBERNATION** (post-image poweroff path):
-- Calls `fix_post_sleep_common` with `schedule_work=false`
-- Does NOT schedule time_sync or any delayed work
-- This notification fires after hibernate image is written but BEFORE the machine powers off
+**PM_POST_HIBERNATION** (fires in BOTH paths, resume detection needed):
 
-**PM_POST_RESTORE** (real hibernate resume):
-- Calls `fix_post_sleep_common` with `schedule_work=true`
+PM_POST_HIBERNATION fires twice: once after image write (about to power off) and once after successful hibernate resume (restored kernel). PM_POST_RESTORE only fires on FAILED restore (boot kernel couldn't load image), so it's useless for the success path.
+
+Detection method: compare monotonic vs wall clock delta since PM_HIBERNATION_PREPARE:
+- **Pre-poweroff path**: both deltas are small (~3-5s), similar values
+- **Resume path**: monotonic delta is tiny (clock frozen during poweroff), wall clock jumped hours/days (RTC kept counting)
+- Threshold: `mono_delta < 30s && real_delta > 60s` = resume
+
+On **pre-poweroff** detection:
+- Calls `fix_post_sleep_common` with `schedule_work=false`
+- Does NOT schedule any delayed work (machine about to shut down)
+
+On **resume** detection:
+- Calls `fix_post_sleep_common` with `schedule_work=false` (no failsafe, no rapid wake tracking)
+- Immediately reports current lid state to input layer via `report_lid_state()`
+- Starts lid poll for ongoing monitoring (no failsafe needed for hibernate)
 - Schedules kernel-space RTC time sync (3s delay)
 - Schedules NTP sync (15s delay)
 - Display state reconciliation (32Hz eDP fix via i915 debugfs)
+
+**PM_POST_RESTORE** (failed image restore only):
+- Only fires when the boot kernel's `software_resume()` fails to load the hibernate image
+- Calls `fix_post_sleep_common` with `schedule_work=false`, clean up only
 
 ### GPE 0x52 Unmask (ACPI IRQ Handler)
 
@@ -88,15 +102,18 @@ After hibernate resume, the system clock is stuck at pre-hibernate time. v2.0 us
 
 **Post-hibernate Stage 1 (3s delay)**: `time_sync_retry_fn`
 
+0. **Chrony offline**: `chronyc offline` pauses chrony BEFORE touching the clock. After hibernate, chrony's internal NTP tracking state is stale (from before hibernate). If we set the clock from RTC first, chrony sees the "wrong" time and steps it BACKWARD by hours, blanking the display via GDM/mutter confusion.
 1. **Kernel-space RTC read**: `rtc_class_open("rtc0")` + `rtc_read_time()` + `rtc_tm_to_time64()`, direct hardware read, no userspace
 2. **Delta validation**: RTC time minus saved pre-hibernate time must be >= 0 and < 30 days (2,592,000 seconds). Catches corrupt RTC, negative time travel, firmware bugs
 3. **Kernel-space clock set**: `do_settimeofday64()`, direct kernel timekeeper update, no syscall, no call_usermodehelper
 4. **Verify-after-set**: Read back via `ktime_get_real_ts64()` and confirm drift within +/- 2 seconds
 5. **Userspace fallback**: If ANY kernel-space step fails, falls back to `date -u -s` from RTC sysfs
 6. **Display fix**: Triggers i915 display state reconciliation via debugfs read
+7. **Backlight restore**: Writes `max_brightness` to `brightness` via `/sys/class/backlight/intel_backlight/` to force backlight on after display reconciliation (the modeset can momentarily blank the display)
 
 **Post-hibernate Stage 2 (15s delay)**: `time_sync_ntp_fn`
-- Runs `chronyc makestep` after network is up for NTP refinement
+- Runs `chronyc online` to bring chrony back (was taken offline in Stage 1)
+- Runs `chronyc makestep` for NTP refinement after source re-selection
 
 ### Why Kernel-Space (Windows RE Findings)
 
@@ -157,13 +174,33 @@ After hibernate, the i915 driver sometimes negotiates 32Hz on the eDP panel inst
   extra/surface_s2idle_fix.ko   # Secondary install
 ```
 
+## Post-Hibernate Display Blank Fix
+
+### The Bug
+After hibernate resume, the screen goes black 1-3 seconds after the login screen appears. Keyboard tap brings it back. NOT actual s2idle (no PM suspend entry in journal).
+
+### Root Cause: Three Factors
+1. **Chrony backward clock step** (primary): After hibernate, chrony's internal NTP tracking state is stale. When the module sets the correct time from RTC at +3s, chrony detects "System clock wrong by -39563 seconds" at +9s and steps the clock BACKWARD ~11 hours. This confuses GDM/mutter display management.
+2. **Display modeset blanking**: Reading `i915_display_info` forces `drm_modeset_lock_all()` which can momentarily blank the display during hardware state reconciliation.
+3. **Bogus rapid wake detection**: `ktime_get()` monotonic clock doesn't advance during hibernate power-off, so `ktime_ms_delta()` always returns ~5s, incorrectly triggering rapid wake tracking and failsafe scheduling.
+
+### The Fix
+1. `chronyc offline` before RTC correction, `chronyc online` 15s later (prevents stale NTP state from fighting the clock set)
+2. Backlight restore via sysfs after display_fix modeset (works without X/Wayland)
+3. PM_POST_RESTORE passes `schedule_work=false`, skips failsafe and rapid wake tracking entirely
+4. Immediate lid state report to input layer after hibernate resume (prevents stale ACPI button state from confusing logind)
+
 ## Current State
 
 - **v2.1 compiled, installed, initramfs rebuilt**: Ready for reboot testing
 - **What to check after hibernate**:
   - `dmesg | grep time_sync` should show: `time_sync: kernel-space RTC set OK (verified, drift=Xs)`
+  - `dmesg | grep chrony_pause` should show: `chronyc offline` ran before RTC set
+  - `dmesg | grep backlight_restore` should show backlight was restored
+  - `dmesg | grep post-restore` should show lid state reported to input layer
   - `date` should show correct time immediately after resume
   - Display should be 60Hz not 32Hz
+  - Display should NOT blank 1-3s after login screen
   - WiFi should reconnect within ~5s
 
 ## Version History
@@ -174,6 +211,7 @@ After hibernate, the i915 driver sometimes negotiates 32Hz on the eDP panel inst
 | v1.x | Added GPE 0x52 unmask via ACPI IRQ handler, lid _STA polling |
 | v2.0 | Rewrote time sync to userspace (hwclock + chronyc), simplified pre-sleep, fixed 32Hz display bug |
 | v2.1 | Kernel-space RTC time sync with delta validation, verify-after-set, userspace fallback. Informed by Windows RE. |
+| v2.1.1 | Fix post-hibernate display blank: chrony offline/online cycle, backlight restore, PM_POST_HIBERNATION resume detection (mono vs real clock delta), immediate lid report. Fixed critical misconception: PM_POST_RESTORE only fires on FAILED restore, not success. |
 
 ## GitHub
 
