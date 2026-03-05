@@ -1707,6 +1707,6 @@ module_exit(surface_s2idle_fix_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Surface Linux Debug");
-MODULE_DESCRIPTION("Fix s2idle/hibernate death sleep on Surface Laptop 5 (v5.1a)");
-MODULE_VERSION("5.1a");
+MODULE_DESCRIPTION("Fix s2idle/hibernate death sleep on Surface Laptop 5 (v5.2a)");
+MODULE_VERSION("5.2a");
 MODULE_ALIAS("dmi:*:svnMicrosoftCorporation:pnSurfaceLaptop5:*");
