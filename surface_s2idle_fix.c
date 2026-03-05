@@ -1352,6 +1352,16 @@ display_fix:
 	 * The modeset lock + hardware re-read can momentarily blank the
 	 * display. Force backlight on via kernel backlight API. */
 	restore_backlight();
+
+	/* Synthetic wakeup event to reset logind/GNOME idle timers.
+	 * Without this, the desktop thinks the user is idle after
+	 * hibernate resume and immediately blanks the screen. */
+	if (lid_input_dev) {
+		input_report_key(lid_input_dev, KEY_WAKEUP, 1);
+		input_sync(lid_input_dev);
+		input_report_key(lid_input_dev, KEY_WAKEUP, 0);
+		input_sync(lid_input_dev);
+	}
 }
 
 /* Stage 2: Kernel-space NTP query + RTC writeback + thaw chronyd.
@@ -1841,6 +1851,8 @@ static int __init surface_s2idle_fix_init(void)
 		lid_input_dev->id.bustype = BUS_HOST;
 		lid_input_dev->evbit[0] = BIT_MASK(EV_SW);
 		lid_input_dev->swbit[0] = BIT_MASK(SW_LID);
+		set_bit(EV_KEY, lid_input_dev->evbit);
+		set_bit(KEY_WAKEUP, lid_input_dev->keybit);
 
 		input_report_switch(lid_input_dev, SW_LID,
 				    !!(initial_padcfg0 & PADCFG0_GPIORXSTATE));
@@ -1863,7 +1875,7 @@ static int __init surface_s2idle_fix_init(void)
 	schedule_delayed_work(&lid_poll_work,
 			      msecs_to_jiffies(LID_POLL_INTERVAL_MS));
 
-	pr_info("v2.0 loaded: SCI=%d, %d pins tracked, "
+	pr_info("v5.1a loaded: SCI=%d, %d pins tracked, "
 		"PADCFG0=0x%08x RXINV=%d RXSTATE=%d, "
 		"pwr=%s lps0=%s debugfs=%s\n",
 		sci_irq, num_tracked_pins, initial_padcfg0,
@@ -1910,7 +1922,7 @@ static void __exit surface_s2idle_fix_exit(void)
 		com4_base = NULL;
 	}
 
-	pr_info("v2.0 unloaded: %u suspends, %u hibernates, "
+	pr_info("v5.1a unloaded: %u suspends, %u hibernates, "
 		"%u PADCFG restores, %u multi-pin fixes, "
 		"%u HOSTSW_OWN fixes, %u spurious wakes\n",
 		stats.suspend_cycles, stats.hibernate_cycles,
@@ -1923,6 +1935,6 @@ module_exit(surface_s2idle_fix_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Surface Linux Debug");
-MODULE_DESCRIPTION("Fix s2idle/hibernate death sleep on Surface Laptop 5 (v2.0)");
-MODULE_VERSION("2.0.0");
+MODULE_DESCRIPTION("Fix s2idle/hibernate death sleep on Surface Laptop 5 (v5.1a)");
+MODULE_VERSION("5.1a");
 MODULE_ALIAS("dmi:*:svnMicrosoftCorporation:pnSurfaceLaptop5:*");
