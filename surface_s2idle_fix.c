@@ -442,6 +442,7 @@ static void check_hostsw_own(const char *caller)
 
 static void gpe52_force_disable(void)
 {
+	acpi_set_gpe_wake_mask(NULL, LID_GPE, ACPI_GPE_DISABLE);
 	acpi_mask_gpe(NULL, LID_GPE, TRUE);
 	acpi_disable_gpe(NULL, LID_GPE);
 	acpi_clear_gpe(NULL, LID_GPE);
@@ -1581,7 +1582,8 @@ static int __init surface_s2idle_fix_init(void)
 	acpi_clear_gpe(NULL, LID_GPE);
 	acpi_mask_gpe(NULL, LID_GPE, FALSE);
 	acpi_set_gpe(NULL, LID_GPE, ACPI_GPE_ENABLE);
-	pr_info("init: GPE 0x52 unmasked and enabled for ACPI lid events\n");
+	acpi_set_gpe_wake_mask(NULL, LID_GPE, ACPI_GPE_DISABLE);
+	pr_info("init: GPE 0x52 unmasked and enabled for ACPI lid events, wake mask disabled\n");
 
 	/* Lid switch input device */
 	lid_input_dev = input_allocate_device();
@@ -1637,6 +1639,7 @@ static void __exit surface_s2idle_fix_exit(void)
 	cancel_delayed_work_sync(&time_sync_ntp_work);
 
 	gpe52_unmask("exit");
+	acpi_set_gpe_wake_mask(NULL, LID_GPE, ACPI_GPE_ENABLE);
 
 	debugfs_teardown();
 

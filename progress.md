@@ -190,18 +190,46 @@ After hibernate resume, the screen goes black 1-3 seconds after the login screen
 3. PM_POST_RESTORE passes `schedule_work=false`, skips failsafe and rapid wake tracking entirely
 4. Immediate lid state report to input layer after hibernate resume (prevents stale ACPI button state from confusing logind)
 
+## v2.2: GPE 0x52 Wake Mask Fix (Hibernate Double-Press)
+
+### The Bug
+After hibernate, the system appears fully off but requires TWO power button presses to boot. First press does absolutely nothing. Second press cold boots and resumes successfully. Regular shutdown only needs one press.
+
+### Root Cause
+During S4/S5 entry, `acpi_hw_legacy_sleep()` (hwsleep.c:66) calls `acpi_hw_enable_all_wakeup_gpes()` which walks all GPE registers and writes the `enable_for_wake` bitmask to hardware. The ACPI button driver marks GPE 0x52 with `ACPI_GPE_CAN_WAKE` (scan.c:1024), so GPE 0x52 gets **RE-ENABLED as a wakeup source** right before the power transition, AFTER the module's `gpe52_force_disable()` already disabled it.
+
+Then during the power-down transition, VNN rail drops, PADCFG corruption fires a phantom GPE 0x52 edge, and the phantom wake immediately aborts S4/S5 entry. System enters a limbo state where the first power button press is consumed/ignored by the EC.
+
+Regular shutdown is unaffected because no freeze/thaw cycle occurs, so PADCFG is clean and no phantom GPE fires even though GPE 0x52 is in the wake mask.
+
+### The Fix
+`acpi_set_gpe_wake_mask(NULL, LID_GPE, ACPI_GPE_DISABLE)` clears GPE 0x52 from the `enable_for_wake` register, preventing `acpi_hw_enable_all_wakeup_gpes()` from re-enabling it during S4/S5 entry. This is an exported, proven ACPICA API already used by the EC driver and ACPI wakeup handler.
+
+GPE 0x52 never needs to be a wakeup source:
+- **s2idle**: module handles lid wake via LPS0 ops
+- **S4 (hibernate)**: power button handles wake
+- **S5 (off)**: power button handles wake
+
+Applied in three places:
+1. `gpe52_force_disable()`: added as first call (belt-and-suspenders for every sleep cycle)
+2. `surface_s2idle_fix_init()`: disabled at module load (covers from first boot)
+3. `surface_s2idle_fix_exit()`: restored to ACPI_GPE_ENABLE (clean unload)
+
+### Key kernel source references
+- `drivers/acpi/acpica/hwsleep.c:66` - `acpi_hw_enable_all_wakeup_gpes()` call during sleep entry
+- `drivers/acpi/acpica/hwgpe.c:488-515` - walks GPE blocks, writes `enable_for_wake` to hardware
+- `drivers/acpi/acpica/evxfgpe.c:491-554` - `acpi_set_gpe_wake_mask()` implementation, ACPI_EXPORT_SYMBOL
+- `drivers/acpi/scan.c:1024-1030` - ACPI button driver marks GPEs with ACPI_GPE_CAN_WAKE
+
 ## Current State
 
-- **v2.1 compiled, installed, initramfs rebuilt**: Ready for reboot testing
-- **What to check after hibernate**:
+- **v2.2 compiled, installed, initramfs rebuilt**: Ready for reboot + hibernate test
+- **What to verify after hibernate**:
+  - Single power button press should wake from hibernate
+  - `dmesg | grep "wake mask"` should show: `init: GPE 0x52 ... wake mask disabled`
   - `dmesg | grep time_sync` should show: `time_sync: kernel-space RTC set OK (verified, drift=Xs)`
-  - `dmesg | grep chrony_pause` should show: `chronyc offline` ran before RTC set
-  - `dmesg | grep backlight_restore` should show backlight was restored
-  - `dmesg | grep post-restore` should show lid state reported to input layer
   - `date` should show correct time immediately after resume
   - Display should be 60Hz not 32Hz
-  - Display should NOT blank 1-3s after login screen
-  - WiFi should reconnect within ~5s
 
 ## Version History
 
@@ -212,6 +240,7 @@ After hibernate resume, the screen goes black 1-3 seconds after the login screen
 | v2.0 | Rewrote time sync to userspace (hwclock + chronyc), simplified pre-sleep, fixed 32Hz display bug |
 | v2.1 | Kernel-space RTC time sync with delta validation, verify-after-set, userspace fallback. Informed by Windows RE. |
 | v2.1.1 | Fix post-hibernate display blank: chrony offline/online cycle, backlight restore, PM_POST_HIBERNATION resume detection (mono vs real clock delta), immediate lid report. Fixed critical misconception: PM_POST_RESTORE only fires on FAILED restore, not success. |
+| v2.2 | Fix hibernate double power button press: `acpi_set_gpe_wake_mask(NULL, LID_GPE, ACPI_GPE_DISABLE)` prevents `acpi_hw_enable_all_wakeup_gpes()` from re-enabling GPE 0x52 during S4/S5 entry. Root cause: phantom PADCFG corruption edge fires after ACPI sleep code re-enables wakeup GPEs, aborting S4/S5 entry. |
 
 ## GitHub
 
