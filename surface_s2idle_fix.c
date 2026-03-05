@@ -73,7 +73,11 @@
 #include <linux/hrtimer.h>
 #include <linux/rtc.h>
 #include <linux/timekeeping.h>
-#include <linux/umh.h>
+#include <linux/net.h>
+#include <linux/in.h>
+#include <net/sock.h>
+#include <linux/sched/signal.h>
+#include <linux/backlight.h>
 #include <linux/debugfs.h>
 #include <linux/seq_file.h>
 
@@ -1022,31 +1026,250 @@ static void fix_post_sleep_common(const char *path_name, bool schedule_work)
 }
 
 /* ========================================================================
- * Post-hibernate time sync (fix "32Hz Of Death")
+ * Post-hibernate time sync and display recovery
  *
- * Strategy: don't try kernel-space do_settimeofday64() at all, it's fragile
- * in PM notifier context and fails silently. Instead schedule userspace
- * commands with a delay so /bin/sh and chronyc are available:
- *   1) hwclock --hctosys --utc  (force system clock from hardware RTC)
- *   2) chronyc makestep          (force NTP step-correct, not slew)
+ * Fully kernel-space, zero call_usermodehelper:
+ *
+ * Sequence (3s after hibernate resume):
+ *   1) SIGSTOP chronyd       (freeze NTP daemon, prevent backward clock step)
+ *   2) rtc_read_time()       (kernel-space RTC read)
+ *   3) do_settimeofday64()   (kernel-space clock set, calls ntp_clear())
+ *   4) i915 display reconciliation (kernel-space debugfs read)
+ *   5) backlight restore     (kernel backlight API)
+ *
+ * Then 15s later:
+ *   6) kernel SNTP query     (UDP socket to NTP server, kernel-space)
+ *   7) do_settimeofday64()   (set clock from NTP ground truth)
+ *   8) rtc_set_time()        (write NTP time back to RTC hardware)
+ *   9) SIGCONT chronyd       (thaw NTP daemon, fresh state sees correct clock)
  * ======================================================================== */
 
-static int run_cmd(const char *cmd, const char *caller)
+/* ---- Chronyd freeze/thaw via kernel signals ---- */
+
+static struct pid *frozen_chronyd_pid;
+
+static void freeze_chronyd(void)
 {
-	char *argv[] = { "/bin/sh", "-c", (char *)cmd, NULL };
-	char *envp[] = {
-		"HOME=/",
-		"PATH=/sbin:/usr/sbin:/bin:/usr/bin",
-		NULL
-	};
+	struct task_struct *task;
+
+	rcu_read_lock();
+	for_each_process(task) {
+		if (strcmp(task->comm, "chronyd") == 0) {
+			frozen_chronyd_pid = get_task_pid(task, PIDTYPE_PID);
+			rcu_read_unlock();
+			kill_pid(frozen_chronyd_pid, SIGSTOP, 1);
+			pr_info("chronyd frozen (pid %d)\n",
+				pid_vnr(frozen_chronyd_pid));
+			return;
+		}
+	}
+	rcu_read_unlock();
+	frozen_chronyd_pid = NULL;
+	pr_info("chronyd not running, skip freeze\n");
+}
+
+static void thaw_chronyd(void)
+{
+	if (!frozen_chronyd_pid)
+		return;
+
+	kill_pid(frozen_chronyd_pid, SIGCONT, 1);
+	pr_info("chronyd thawed (pid %d)\n", pid_vnr(frozen_chronyd_pid));
+	put_pid(frozen_chronyd_pid);
+	frozen_chronyd_pid = NULL;
+}
+
+/* ---- Kernel-space SNTP client ---- */
+
+#define NTP_EPOCH_OFFSET	2208988800ULL
+#define NTP_PACKET_SIZE		48
+#define NTP_PORT		123
+#define NTP_TIMEOUT_MS		3000
+
+/* Google Public NTP anycast IPs (time.google.com) */
+static const __be32 ntp_servers[] = {
+	__constant_htonl(0xD8EF2300),	/* 216.239.35.0 */
+	__constant_htonl(0xD8EF2304),	/* 216.239.35.4 */
+	__constant_htonl(0xD8EF2308),	/* 216.239.35.8 */
+	__constant_htonl(0xD8EF230C),	/* 216.239.35.12 */
+};
+
+struct ntp_packet {
+	u8	li_vn_mode;
+	u8	stratum;
+	u8	poll;
+	s8	precision;
+	__be32	root_delay;
+	__be32	root_dispersion;
+	__be32	reference_id;
+	__be32	ref_ts_sec;
+	__be32	ref_ts_frac;
+	__be32	orig_ts_sec;
+	__be32	orig_ts_frac;
+	__be32	recv_ts_sec;
+	__be32	recv_ts_frac;
+	__be32	xmit_ts_sec;
+	__be32	xmit_ts_frac;
+} __packed;
+
+/*
+ * Query NTP time from kernel space via UDP socket.
+ * Tries multiple Google NTP servers sequentially.
+ * Returns 0 on success with time in @ntp_time, negative errno on failure.
+ */
+static int kernel_ntp_query(struct timespec64 *ntp_time)
+{
+	struct socket *sock;
+	struct sockaddr_in server;
+	struct ntp_packet request, response;
+	struct msghdr msg;
+	struct kvec iov;
+	struct timespec64 t4;
+	time64_t server_sec;
+	s64 diff;
+	int ret, i;
+
+	ret = sock_create_kern(&init_net, AF_INET, SOCK_DGRAM,
+			       IPPROTO_UDP, &sock);
+	if (ret) {
+		pr_warn("ntp_query: sock_create failed (%d)\n", ret);
+		return ret;
+	}
+
+	/* Receive timeout so we don't block forever */
+	sock->sk->sk_rcvtimeo = msecs_to_jiffies(NTP_TIMEOUT_MS);
+
+	for (i = 0; i < ARRAY_SIZE(ntp_servers); i++) {
+		/* SNTP client request: LI=0, VN=4, Mode=3 */
+		memset(&request, 0, sizeof(request));
+		request.li_vn_mode = 0x23;
+
+		memset(&server, 0, sizeof(server));
+		server.sin_family = AF_INET;
+		server.sin_port = htons(NTP_PORT);
+		server.sin_addr.s_addr = ntp_servers[i];
+
+		/* Send */
+		memset(&msg, 0, sizeof(msg));
+		msg.msg_name = &server;
+		msg.msg_namelen = sizeof(server);
+		iov.iov_base = &request;
+		iov.iov_len = sizeof(request);
+
+		ret = kernel_sendmsg(sock, &msg, &iov, 1, sizeof(request));
+		if (ret != sizeof(request)) {
+			pr_warn("ntp_query: send to server %d failed (%d)\n",
+				i, ret);
+			continue;
+		}
+
+		/* Receive */
+		memset(&response, 0, sizeof(response));
+		memset(&msg, 0, sizeof(msg));
+		iov.iov_base = &response;
+		iov.iov_len = sizeof(response);
+
+		ret = kernel_recvmsg(sock, &msg, &iov, 1,
+				     sizeof(response), 0);
+		if (ret != sizeof(response)) {
+			pr_warn("ntp_query: recv from server %d failed (%d)\n",
+				i, ret);
+			continue;
+		}
+
+		/* Record local receive time */
+		ktime_get_real_ts64(&t4);
+
+		/* Validate: mode should be 4 (server) */
+		if ((response.li_vn_mode & 0x07) != 4) {
+			pr_warn("ntp_query: bad mode from server %d\n", i);
+			continue;
+		}
+
+		/* Validate stratum (1-15 valid, 0=kiss-of-death, 16=unsync) */
+		if (response.stratum == 0 || response.stratum > 15) {
+			pr_warn("ntp_query: bad stratum %d from server %d\n",
+				response.stratum, i);
+			continue;
+		}
+
+		/* Extract server transmit timestamp, NTP epoch -> Unix epoch */
+		server_sec = (time64_t)ntohl(response.xmit_ts_sec)
+			     - NTP_EPOCH_OFFSET;
+
+		/* Sanity: NTP time should be within 30 days of local clock */
+		diff = server_sec - t4.tv_sec;
+		if (diff < -2592000 || diff > 2592000) {
+			pr_warn("ntp_query: insane offset %llds from server %d\n",
+				diff, i);
+			continue;
+		}
+
+		ntp_time->tv_sec = server_sec;
+		ntp_time->tv_nsec = 0;
+
+		pr_info("ntp_query: server %d responded (stratum %d, "
+			"offset %llds)\n", i, response.stratum, diff);
+
+		sock_release(sock);
+		return 0;
+	}
+
+	sock_release(sock);
+	pr_warn("ntp_query: all %zu servers failed\n", ARRAY_SIZE(ntp_servers));
+	return -ETIMEDOUT;
+}
+
+/*
+ * Restore backlight to max brightness via kernel backlight API.
+ * Replaces: cat max_brightness > brightness via call_usermodehelper
+ */
+static void restore_backlight(void)
+{
+	struct backlight_device *bd;
 	int ret;
 
-	ret = call_usermodehelper(argv[0], argv, envp, UMH_WAIT_PROC);
+	bd = backlight_device_get_by_name("intel_backlight");
+	if (!bd) {
+		pr_warn("backlight_restore: intel_backlight not found\n");
+		return;
+	}
+
+	ret = backlight_device_set_brightness(bd, bd->props.max_brightness);
 	if (ret)
-		pr_warn("%s: '%s' failed (%d)\n", caller, cmd, ret);
+		pr_warn("backlight_restore: set failed (%d)\n", ret);
 	else
-		pr_info("%s: '%s' ok\n", caller, cmd);
-	return ret;
+		pr_info("backlight_restore: set to max (%d)\n",
+			bd->props.max_brightness);
+
+	put_device(&bd->dev);
+}
+
+/*
+ * Trigger i915 display state reconciliation via debugfs read.
+ * Reading i915_display_info forces drm_modeset_lock_all() which
+ * re-reads hardware state, fixing 32Hz eDP after hibernate.
+ * Replaces: cat i915_display_info > /dev/null via call_usermodehelper
+ */
+static void trigger_display_reconciliation(void)
+{
+	struct file *f;
+	char buf[256];
+	loff_t pos = 0;
+
+	f = filp_open("/sys/kernel/debug/dri/0000:00:02.0/i915_display_info",
+		      O_RDONLY, 0);
+	if (IS_ERR(f)) {
+		pr_warn("display_fix: cannot open i915_display_info (%ld)\n",
+			PTR_ERR(f));
+		return;
+	}
+
+	/* Reading triggers drm_modeset_lock_all() which forces
+	 * hardware state reconciliation, fixing 32Hz eDP */
+	kernel_read(f, buf, sizeof(buf), &pos);
+	filp_close(f, NULL);
+	pr_info("display_fix: i915 state reconciliation triggered\n");
 }
 
 static void time_sync_retry_fn(struct work_struct *work)
@@ -1056,12 +1279,12 @@ static void time_sync_retry_fn(struct work_struct *work)
 	struct timespec64 rtc_ts, now_ts;
 	time64_t delta;
 
-	/* Step 0: Take chrony offline BEFORE touching the clock.
+	/* Step 0: Freeze chronyd BEFORE touching the clock.
 	 * After hibernate, chrony's internal tracking state is stale (from
 	 * before hibernate). If we set the clock from RTC first, chrony
 	 * sees the "wrong" time and steps it BACKWARD by hours, causing
-	 * GDM/mutter to blank the display. Pausing chrony prevents this. */
-	run_cmd("chronyc offline", "time_sync_chrony_pause");
+	 * GDM/mutter to blank the display. SIGSTOP prevents this. */
+	freeze_chronyd();
 
 	/* Step 1: Read RTC directly from hardware via kernel API.
 	 * This is the Linux analog of Windows' HalQueryRealTimeClock,
@@ -1070,14 +1293,14 @@ static void time_sync_retry_fn(struct work_struct *work)
 	 * because Linux's timekeeping_resume() fails with acpi_sleep=nonvs. */
 	rtc = rtc_class_open("rtc0");
 	if (!rtc) {
-		pr_warn("time_sync: cannot open rtc0, falling back to userspace\n");
-		goto userspace_fallback;
+		pr_warn("time_sync: cannot open rtc0\n");
+		goto display_fix;
 	}
 
 	if (rtc_read_time(rtc, &tm)) {
-		pr_warn("time_sync: rtc_read_time failed, falling back\n");
+		pr_warn("time_sync: rtc_read_time failed\n");
 		rtc_class_close(rtc);
-		goto userspace_fallback;
+		goto display_fix;
 	}
 	rtc_class_close(rtc);
 
@@ -1092,66 +1315,91 @@ static void time_sync_retry_fn(struct work_struct *work)
 		delta = rtc_ts.tv_sec - saved_pre_hibernate_ts.tv_sec;
 		pr_info("time_sync: hibernate delta = %lld seconds\n", delta);
 		if (delta < 0 || delta > 2592000) {
-			pr_warn("time_sync: insane delta %lld, skipping kernel set\n",
+			pr_warn("time_sync: insane delta %lld, skipping\n",
 				delta);
-			goto userspace_fallback;
+			goto display_fix;
 		}
 	}
 
 	/* Step 3: Set system clock from kernel space.
-	 * This is the Linux equivalent of Windows' KeSetSystemTime. */
+	 * This is the Linux equivalent of Windows' KeSetSystemTime.
+	 * do_settimeofday64() internally calls ntp_clear() via
+	 * TK_CLEAR_NTP flag, resetting kernel NTP state. */
 	if (do_settimeofday64(&rtc_ts)) {
-		pr_warn("time_sync: do_settimeofday64 failed, falling back\n");
-		goto userspace_fallback;
+		pr_warn("time_sync: do_settimeofday64 failed\n");
+		goto display_fix;
 	}
 
 	/* Step 4: Verify it actually stuck by reading back */
 	ktime_get_real_ts64(&now_ts);
 	delta = now_ts.tv_sec - rtc_ts.tv_sec;
 	if (delta < -2 || delta > 2) {
-		pr_warn("time_sync: verify failed (drift=%llds), falling back\n",
-			delta);
-		goto userspace_fallback;
+		pr_warn("time_sync: verify failed (drift=%llds)\n", delta);
+		goto display_fix;
 	}
 
 	pr_info("time_sync: kernel-space RTC set OK (verified, drift=%llds)\n",
 		delta);
 	stats.time_syncs++;
-	goto display_fix;
-
-userspace_fallback:
-	/* Fallback: date -u -s from RTC sysfs.
-	 * If kernel-space somehow fails, this is plan B. */
-	if (run_cmd("date -u -s \"$(cat /sys/class/rtc/rtc0/date) "
-		    "$(cat /sys/class/rtc/rtc0/time)\"",
-		    "time_sync_fallback") == 0)
-		stats.time_syncs++;
 
 display_fix:
 	/* Trigger i915 display state reconciliation.
-	 * Reading i915_display_info forces drm_modeset_lock_all() and
-	 * a hardware state re-read, fixing 32Hz eDP link after hibernate. */
-	run_cmd("cat /sys/kernel/debug/dri/0000:00:02.0/i915_display_info"
-		" > /dev/null 2>&1", "display_fix");
+	 * Reading i915_display_info forces drm_modeset_lock_all() which
+	 * re-reads hardware state, fixing 32Hz eDP link after hibernate. */
+	trigger_display_reconciliation();
 
 	/* Restore backlight to max after display reconciliation.
 	 * The modeset lock + hardware re-read can momentarily blank the
-	 * display. Force backlight on via sysfs (works without X/Wayland). */
-	run_cmd("cat /sys/class/backlight/intel_backlight/max_brightness"
-		" > /sys/class/backlight/intel_backlight/brightness"
-		" 2>/dev/null", "backlight_restore");
+	 * display. Force backlight on via kernel backlight API. */
+	restore_backlight();
 }
 
-/* Stage 3: Delayed NTP step. chronyc makestep needs a selected source,
- * which takes ~10s after hibernate resume (sources go offline during
- * hibernate, need to re-poll). 15s delay ensures source selection. */
+/* Stage 2: Kernel-space NTP query + RTC writeback + thaw chronyd.
+ * 15s delay ensures network is up after hibernate resume.
+ * Replaces chronyc online/makestep with direct SNTP UDP query. */
 static void time_sync_ntp_fn(struct work_struct *work)
 {
-	/* Bring chrony back online (was taken offline in time_sync_retry_fn
-	 * to prevent backward clock step). 15s delay gives chrony time to
-	 * re-establish NTP source selection after hibernate resume. */
-	run_cmd("chronyc online", "ntp_sync");
-	run_cmd("chronyc makestep", "ntp_sync");
+	struct timespec64 ntp_time, now;
+	struct rtc_device *rtc;
+	struct rtc_time tm;
+
+	/* Query NTP ground truth via kernel UDP socket */
+	if (kernel_ntp_query(&ntp_time) == 0) {
+		/* Set system clock from NTP */
+		if (do_settimeofday64(&ntp_time) == 0) {
+			pr_info("ntp_sync: clock set from NTP "
+				"(offset %llds from RTC)\n",
+				ntp_time.tv_sec -
+				saved_pre_hibernate_ts.tv_sec);
+			stats.time_syncs++;
+
+			/* Settle time for clock propagation */
+			msleep(2000);
+
+			/* Write NTP-corrected time to RTC hardware */
+			rtc = rtc_class_open("rtc0");
+			if (rtc) {
+				ktime_get_real_ts64(&now);
+				rtc_time64_to_tm(now.tv_sec, &tm);
+				if (rtc_set_time(rtc, &tm))
+					pr_warn("ntp_sync: rtc_set_time "
+						"failed\n");
+				else
+					pr_info("ntp_sync: RTC synced to "
+						"NTP time\n");
+				rtc_class_close(rtc);
+			}
+		} else {
+			pr_warn("ntp_sync: do_settimeofday64 failed\n");
+		}
+	} else {
+		pr_warn("ntp_sync: NTP query failed, keeping RTC time\n");
+	}
+
+	/* Always thaw chronyd, even if NTP failed.
+	 * Chronyd sees the (now correct) clock and rebuilds its
+	 * tracking state from scratch via fresh NTP polls. */
+	thaw_chronyd();
 }
 
 /* ========================================================================
@@ -1637,6 +1885,9 @@ static void __exit surface_s2idle_fix_exit(void)
 	cancel_delayed_work_sync(&lid_failsafe_work);
 	cancel_delayed_work_sync(&time_sync_retry_work);
 	cancel_delayed_work_sync(&time_sync_ntp_work);
+
+	/* Safety: unfreeze chronyd if module unloads during hibernate sync */
+	thaw_chronyd();
 
 	gpe52_unmask("exit");
 	acpi_set_gpe_wake_mask(NULL, LID_GPE, ACPI_GPE_ENABLE);
