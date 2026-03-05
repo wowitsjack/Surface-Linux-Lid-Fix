@@ -183,7 +183,6 @@ static int sci_irq;
  * Mean: ~39631s. Detect by comparing RTC delta against this known offset. */
 #define UEFI_RTC_CORRUPTION_OFFSET  39600  /* ~11 hours in seconds */
 #define UEFI_RTC_CORRUPTION_WINDOW  600    /* +/-10 min detection tolerance */
-#define RTC_SANE_MAX_DELTA          3600   /* 1 hour: max believable hibernate */
 
 /* Work items and timers */
 static struct delayed_work lid_failsafe_work;
@@ -1138,7 +1137,7 @@ static void time_sync_retry_fn(struct work_struct *work)
 
 	if (delta > (UEFI_RTC_CORRUPTION_OFFSET - UEFI_RTC_CORRUPTION_WINDOW) &&
 	    delta < (UEFI_RTC_CORRUPTION_OFFSET + UEFI_RTC_CORRUPTION_WINDOW)) {
-		/* BEST PATH: Known firmware corruption detected.
+		/* UEFI firmware corruption detected.
 		 * Subtract the ~39600s offset to recover actual hibernate duration.
 		 * Result: second-accurate wall clock. */
 		hibernate_duration = delta - UEFI_RTC_CORRUPTION_OFFSET;
@@ -1147,17 +1146,16 @@ static void time_sync_retry_fn(struct work_struct *work)
 		pr_info("time_sync: UEFI RTC corruption detected "
 			"(delta=%llds, offset=%d, hibernate=%llds)\n",
 			delta, UEFI_RTC_CORRUPTION_OFFSET, hibernate_duration);
-	} else if (delta >= 0 && delta < RTC_SANE_MAX_DELTA) {
-		/* GOOD PATH: RTC looks sane (firmware fixed? different device?).
-		 * Use RTC directly. */
+	} else if (delta >= 0) {
+		/* RTC not corrupted. Trust it directly regardless of duration. */
 		corrected_ts = rtc_ts;
 		pr_info("time_sync: RTC sane (delta=%llds), using directly\n",
 			delta);
 	} else {
-		/* FALLBACK: Unknown corruption, use saved timestamp.
-		 * Off by actual hibernate duration, chronyd corrects. */
+		/* Negative delta = RTC went backwards. Something very wrong.
+		 * Use saved timestamp as best-effort. */
 		corrected_ts = saved_pre_hibernate_ts;
-		pr_warn("time_sync: unexpected RTC delta %llds, "
+		pr_warn("time_sync: RTC went backwards (delta=%llds), "
 			"falling back to saved timestamp\n", delta);
 	}
 
