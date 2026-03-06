@@ -203,6 +203,7 @@ static struct timespec64 saved_pre_hibernate_ts;
 static ktime_t saved_pre_hibernate_mono;
 static int last_poll_rxstate;
 static unsigned int failsafe_suspends;
+static unsigned int padcfg_restores_at_entry;	/* track corruption during s2idle */
 static unsigned int resync_polls_remaining;
 
 /* Lid switch input device */
@@ -355,8 +356,23 @@ static bool restore_pin(struct pin_context *pin)
 		stats.conditional_skips++;
 	}
 
-	if (modified)
+	if (modified) {
+		u32 tmp;
+
 		wmb(); /* ensure all writes committed */
+
+		/* Toggle GPIORXDIS to force pin input buffer re-latch.
+		 * VNN power-gating can corrupt the input buffer state,
+		 * not just the config registers. Without this, RXSTATE
+		 * may read stale/wrong values after PADCFG restoration. */
+		tmp = readl(pin_addr(pin) + PADCFG0_OFF);
+		writel(tmp | PADCFG0_GPIORXDIS, pin_addr(pin) + PADCFG0_OFF);
+		wmb();
+		udelay(10);
+		writel(tmp & ~PADCFG0_GPIORXDIS, pin_addr(pin) + PADCFG0_OFF);
+		wmb();
+		udelay(100); /* let RXSTATE settle */
+	}
 
 	return modified;
 }
@@ -937,8 +953,9 @@ static void fix_pre_sleep_common(const char *path_name)
 		cancel_delayed_work_sync(&lid_failsafe_work);
 	}
 
-	last_suspend_entry = ktime_get();
+	last_suspend_entry = ktime_get_boottime();
 	atomic_set(&power_button_seen, 0);
+	padcfg_restores_at_entry = stats.padcfg_restores;
 
 	/* Save all tracked pins (multi-pin, like Windows full-bank save) */
 	save_all_pins();
@@ -985,7 +1002,7 @@ static void fix_post_sleep_common(const char *path_name, bool schedule_work)
 
 	if (schedule_work) {
 		/* Track rapid wakes for exponential backoff */
-		sleep_ms = ktime_ms_delta(ktime_get(), last_suspend_entry);
+		sleep_ms = ktime_ms_delta(ktime_get_boottime(), last_suspend_entry);
 		if (sleep_ms < RAPID_WAKE_THRESHOLD_MS) {
 			consecutive_rapid_wakes++;
 			pr_info("%s: rapid wake (%lldms), streak=%u\n",
@@ -1221,6 +1238,17 @@ static int s2idle_pm_notify(struct notifier_block *nb,
 
 	case PM_POST_SUSPEND:
 		fix_post_sleep_common("post-suspend", true);
+
+		/* If PADCFG corruption happened during this s2idle cycle,
+		 * the display may not have come back. Trigger display
+		 * reconciliation and backlight restore to prevent the
+		 * appearance of death sleep on a running system. */
+		if (stats.padcfg_restores > padcfg_restores_at_entry) {
+			pr_info("post-suspend: PADCFG corruption detected "
+				"during s2idle, triggering display recovery\n");
+			trigger_display_reconciliation();
+			restore_backlight();
+		}
 		break;
 
 	case PM_POST_HIBERNATION: {
@@ -1651,7 +1679,7 @@ static int __init surface_s2idle_fix_init(void)
 	schedule_delayed_work(&lid_poll_work,
 			      msecs_to_jiffies(LID_POLL_INTERVAL_MS));
 
-	pr_info("v5.1a loaded: SCI=%d, %d pins tracked, "
+	pr_info("v5.3 loaded: SCI=%d, %d pins tracked, "
 		"PADCFG0=0x%08x RXINV=%d RXSTATE=%d, "
 		"pwr=%s lps0=%s debugfs=%s\n",
 		sci_irq, num_tracked_pins, initial_padcfg0,
@@ -1694,7 +1722,7 @@ static void __exit surface_s2idle_fix_exit(void)
 		com4_base = NULL;
 	}
 
-	pr_info("v5.1a unloaded: %u suspends, %u hibernates, "
+	pr_info("v5.3 unloaded: %u suspends, %u hibernates, "
 		"%u PADCFG restores, %u multi-pin fixes, "
 		"%u HOSTSW_OWN fixes, %u spurious wakes\n",
 		stats.suspend_cycles, stats.hibernate_cycles,
@@ -1707,6 +1735,6 @@ module_exit(surface_s2idle_fix_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Surface Linux Debug");
-MODULE_DESCRIPTION("Fix s2idle/hibernate death sleep on Surface Laptop 5 (v5.2a)");
-MODULE_VERSION("5.2a");
+MODULE_DESCRIPTION("Fix s2idle/hibernate death sleep on Surface Laptop 5 (v5.3)");
+MODULE_VERSION("5.3");
 MODULE_ALIAS("dmi:*:svnMicrosoftCorporation:pnSurfaceLaptop5:*");
