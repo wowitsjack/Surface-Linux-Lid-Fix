@@ -2,9 +2,9 @@
 /*
  * surface_s2idle_fix.c - Fix s2idle/hibernate death sleep on Surface Laptop 5
  *
- * Version 2.0: Redesigned based on reverse engineering of 4 Windows drivers
+ * Version 2.0: Redesigned based on analysis of Windows driver behaviour
  * (iaLPSS2_GPIO2_ADL.sys, msgpioclx.sys, SurfaceButton.sys, intelpep.sys)
- * and analysis of Linux pinctrl-intel + ACPI s2idle kernel source.
+ * and Linux pinctrl-intel + ACPI s2idle kernel source.
  *
  * Root cause:
  *   Intel INTC1055 GPIO Community 4's VNN (VCCIO nanonode) power rail drops
