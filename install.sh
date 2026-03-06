@@ -4,8 +4,8 @@ set -e
 MODULE_NAME="surface_s2idle_fix"
 MODULES_LOAD_CONF="/etc/modules-load.d/surface-s2idle-fix.conf"
 
-echo "Surface Laptop 5 s2idle fix - installer"
-echo "========================================="
+echo "Surface Laptop 5 s2idle/hibernate fix (v5.2a) - installer"
+echo "========================================================"
 echo
 
 # Check if running on a Surface Laptop 5

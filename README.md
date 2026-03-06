@@ -1,6 +1,6 @@
-# Surface Series s2idle Fix
+# Surface Series s2idle/Hibernate Fix
 
-A kernel module that fixes the "death sleep" bug on the Microsoft Surface series, where the laptop enters s2idle suspend and never wakes up again, requiring a hard reset.
+A kernel module that fixes the "death sleep" bug on the Microsoft Surface series, where the laptop enters s2idle suspend and never wakes up again, requiring a hard reset. v5.2a extends this to full hibernate (suspend-to-disk) support with RTC-based time sync, wifi recovery, and display reconnect.
 
 Also includes a bonus script to fix audio crackling common on Intel Alder Lake devices running Linux.
 
@@ -34,6 +34,14 @@ This module:
 - **LPS0 check callback** polls RXSTATE for genuine lid-open events, only calling `pm_system_wakeup()` when the lid is actually open
 - **Post-resume failsafe** detects spurious wakes (lid still closed, no power button) and re-suspends automatically, with exponential backoff to prevent rapid sleep-wake storms
 - **SW_LID input device** emits lid open/close events so your desktop environment handles suspend policy natively (the module does NOT force suspend on lid close)
+
+### v5.2a: Hibernate + Hardening
+
+- **Full hibernate PM ops** (`freeze`/`thaw`/`poweroff`/`restore`), PADCFG protection covers suspend-to-disk too
+- **RTC-based time sync** after long hibernation. The system clock drifts significantly during 11h+ hibernation, the module reads the hardware RTC on resume and corrects via `do_settimeofday64()`, capped to prevent setting time backwards on short hibernates
+- **Post-resume wifi bounce.** NetworkManager sometimes comes back with stale interfaces after hibernate, the module kicks a reconnect
+- **Display reconnect.** DRM reprobing after hibernate recovers blank/frozen displays
+- **Self-contained timekeeping,** no external SNTP dependency
 
 ## Uninstall
 
@@ -121,6 +129,7 @@ systemctl --user restart pipewire pipewire-pulse wireplumber
 - Kernel 6.18.x (linux-surface)
 - Ubuntu 25.10, Ubuntu 24.04
 - GNOME, KDE Plasma
+- s2idle cycles, hibernate cycles, extended sleep (11h+), repeated lid open/close
 
 ## Related
 
